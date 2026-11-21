@@ -209,4 +209,37 @@ mod tests {
         assert_eq!(exact - start, 1_800_000);
         assert_eq!(over - start, 1_800_001);
     }
+
+    #[test]
+    fn verifies_exact_millisecond_boundaries() {
+        use ParsedTimestamp::Millis;
+
+        let start = parse_timestamp(b"1791021600000");
+        let exactly_30_minutes = parse_timestamp(b"1791023400000");
+        let one_ms_over = parse_timestamp(b"1791023400001");
+
+        assert_eq!(start, Some(Millis(1791021600000)));
+        assert_eq!(exactly_30_minutes, Some(Millis(1791023400000)));
+        assert_eq!(one_ms_over, Some(Millis(1791023400001)));
+
+        // These three formats represent exactly the same UTC instant.
+        assert_eq!(parse_timestamp(b"2026-10-03T10:00:00Z"), start);
+        assert_eq!(parse_timestamp(b"2026-10-03T12:00:00+02:00"), start);
+        assert_eq!(parse_timestamp(b"2026-10-03T05:30:00-04:30"), start);
+
+        let Some(Millis(t0)) = start else {
+            panic!("Expected a timestamp in integer milliseconds");
+        };
+        let Some(Millis(t30)) = exactly_30_minutes else {
+            panic!("Expected a timestamp in integer milliseconds");
+        };
+        let Some(Millis(t30_plus_one)) = one_ms_over else {
+            panic!("Expected a timestamp in integer milliseconds");
+        };
+
+        // Sessionization must use > 1,800,000 ms, not >=.
+        assert_eq!(t30 - t0, 1_800_000);
+        assert_eq!(t30_plus_one - t0, 1_800_001);
+    }
+
 }
