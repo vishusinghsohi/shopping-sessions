@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedTimestamp {
     Millis(i64),
@@ -18,9 +17,7 @@ fn number(bytes: &[u8]) -> Option<i64> {
             return None;
         }
 
-        result = result
-            .checked_mul(10)?
-            .checked_add((byte - b'0') as i64)?;
+        result = result.checked_mul(10)?.checked_add((byte - b'0') as i64)?;
     }
 
     Some(result)
@@ -80,20 +77,13 @@ pub fn parse_timestamp(raw: &[u8]) -> Option<ParsedTimestamp> {
     let f1 = raw.len() == 20 && raw[19] == b'Z';
 
     // F2: YYYY-MM-DDTHH:MM:SS+HH:MM or -HH:MM
-    let f2 = raw.len() == 25
-        && (raw[19] == b'+' || raw[19] == b'-')
-        && raw[22] == b':';
+    let f2 = raw.len() == 25 && (raw[19] == b'+' || raw[19] == b'-') && raw[22] == b':';
 
     if !f1 && !f2 {
         return None;
     }
 
-    if raw[4] != b'-'
-        || raw[7] != b'-'
-        || raw[10] != b'T'
-        || raw[13] != b':'
-        || raw[16] != b':'
-    {
+    if raw[4] != b'-' || raw[7] != b'-' || raw[10] != b'T' || raw[13] != b':' || raw[16] != b':' {
         return None;
     }
 
@@ -116,8 +106,7 @@ pub fn parse_timestamp(raw: &[u8]) -> Option<ParsedTimestamp> {
 
     let days = days_from_civil(year, month, day);
 
-    let local_seconds =
-        days * 86400 + hour * 3600 + minute * 60 + second;
+    let local_seconds = days * 86400 + hour * 3600 + minute * 60 + second;
 
     let offset_seconds = if f2 {
         let offset_hours = number(&raw[20..22])?;
@@ -241,5 +230,4 @@ mod tests {
         assert_eq!(t30 - t0, 1_800_000);
         assert_eq!(t30_plus_one - t0, 1_800_001);
     }
-
 }

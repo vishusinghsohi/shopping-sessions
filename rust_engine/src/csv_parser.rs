@@ -1,8 +1,4 @@
-
-pub fn parse_line(
-    line: &[u8],
-    expected_columns: usize,
-) -> Option<Vec<&[u8]>> {
+pub fn parse_line(line: &[u8], expected_columns: usize) -> Option<Vec<&[u8]>> {
     if line.is_empty() {
         return None;
     }
