@@ -1,23 +1,54 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+
+# =====================================================
+# STAGE 1: Build the optimized Rust engine
+# =====================================================
+
+FROM rust:1-bookworm AS rust_builder
+
+WORKDIR /build
+
+COPY rust_engine/Cargo.toml rust_engine/Cargo.lock /build/rust_engine/
+COPY rust_engine/src/ /build/rust_engine/src/
+
+RUN cargo build \
+    --locked \
+    --release \
+    --manifest-path /build/rust_engine/Cargo.toml
+
+# =====================================================
+# STAGE 2: Python + DuckDB runtime
+# =====================================================
+
 FROM python:3.12-slim-bookworm
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+RUN useradd \
+    --uid 1000 \
+    --no-create-home \
+    --home-dir /scratch \
+    app
+
+WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+
+RUN pip install \
+    --no-cache-dir \
+    -r /app/requirements.txt
+
+COPY --from=rust_builder \
+    /build/rust_engine/target/release/rust_engine \
+    /app/rust_engine
 
 COPY pipeline/ /app/pipeline/
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
 
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Remove Windows BOM and CRLF from run.sh.
+RUN python3 -c 'from pathlib import Path; p=Path("/app/run.sh"); data=p.read_bytes().removeprefix(bytes.fromhex("efbbbf")).replace(b"\r\n", b"\n"); p.write_bytes(data)' \
+    && chmod 755 /app/run.sh /app/rust_engine
 
-WORKDIR /app
-CMD ["/app/run.sh"]
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# IMPORTANT:
+# Start the script explicitly with the Linux shell.
+CMD ["/bin/sh", "/app/run.sh"]
