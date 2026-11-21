@@ -1,11 +1,25 @@
 
 #!/usr/bin/env python3
-"""Run the verified Rust logic and convert its reports to typed Parquet."""
+"""
+Shopping Sessions — optimized Parquet output.
+
+Rust performs all competition business logic.
+
+For ordinary diagnostic CSV reports:
+    Rust CSV -> DuckDB -> Parquet
+
+For reports containing special CSV characters:
+    Rust CSV -> safe JSON conversion -> DuckDB -> Parquet
+
+Both paths produce the required typed Parquet schemas.
+"""
 
 import json
 import os
-from pathlib import Path
+import resource
 import subprocess
+import time
+from pathlib import Path
 
 import duckdb
 
@@ -30,18 +44,72 @@ SCHEMAS = {
 }
 
 def sql_string(value):
+    """Escape a string for use in a DuckDB SQL statement."""
     return "'" + str(value).replace("'", "''") + "'"
+
+def sql_identifier(value):
+    """Escape a SQL column identifier."""
+    return '"' + value.replace('"', '""') + '"'
+
+def typed_select(schema):
+    """Select columns in the exact competition order."""
+    return ", ".join(
+        f"CAST({sql_identifier(name)} AS {kind}) "
+        f"AS {sql_identifier(name)}"
+        for name, kind in schema
+    )
+
+def inspect_diagnostic_csv(path, schema):
+    """
+    Check whether DuckDB's fast CSV reader is safe
+    for this particular Rust report.
+
+    Direct CSV is used only if:
+    - The header matches.
+    - No carriage returns appear in data.
+    - No double-quote characters appear in data.
+
+    Rust's output format never embeds commas or LF
+    inside fields.
+
+    Special-character cases use our existing,
+    byte-preserving JSON conversion instead.
+    """
+    names = [name for name, _ in schema]
+
+    expected = ",".join(names).encode("utf-8")
+
+    with path.open("rb") as source:
+        header = source.readline()
+
+        if header.endswith(b"\n"):
+            header = header[:-1]
+
+        if header != expected:
+            raise ValueError(
+                f"Unexpected columns in {path}: {header!r}"
+            )
+
+        has_rows = False
+        safe_for_direct_csv = True
+
+        while True:
+            block = source.read(4 * 1024 * 1024)
+
+            if not block:
+                break
+
+            has_rows = True
+
+            if b"\r" in block or b'"' in block:
+                safe_for_direct_csv = False
+
+    return has_rows, safe_for_direct_csv
 
 def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
     """
-    Convert Rust's restricted diagnostic CSV to NDJSON.
-
-    Read LF-separated records at the byte level.
-    A CR inside the final field is data, not a
-    record terminator.
-
-    The Rust diagnostic CSV contains no embedded
-    commas or escaped quotes.
+    Safe fallback for the competition's unusual
+    characters and exact LF-only row boundaries.
     """
     names = [name for name, _ in schema]
 
@@ -68,7 +136,7 @@ def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
 
         if header != expected_header:
             raise ValueError(
-                f"Unexpected columns in {csv_path}: {header!r}"
+                f"Unexpected CSV header: {header!r}"
             )
 
         for raw in source:
@@ -79,7 +147,7 @@ def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
 
             if len(cells) != len(names):
                 raise ValueError(
-                    f"Malformed diagnostic CSV row in {csv_path}"
+                    f"Malformed diagnostic CSV row: {csv_path}"
                 )
 
             record = {}
@@ -109,60 +177,210 @@ def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
 
     return count
 
-def parquet_copy(
-    con,
-    name,
-    schema,
-    json_path,
-    row_count,
-    output_dir,
-):
-    destination = output_dir / name
-    destination.mkdir(parents=True, exist_ok=True)
-
-    parquet_file = destination / "part-0.parquet"
-
-    typed_columns = ", ".join(
-        f'CAST("{field}" AS {kind}) AS "{field}"'
-        for field, kind in schema
+def copy_to_parquet(con, query, destination):
+    """Execute an actual DuckDB Parquet export."""
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-
-    if row_count:
-        json_types = ", ".join(
-            f"'{field}': "
-            f"'{'BIGINT' if kind == 'BIGINT' else 'VARCHAR'}'"
-            for field, kind in schema
-        )
-
-        query = (
-            f"SELECT {typed_columns} "
-            f"FROM read_json("
-            f"{sql_string(json_path)}, "
-            f"format='newline_delimited', "
-            f"columns={{{json_types}}})"
-        )
-
-    else:
-        # Empty fixtures still need valid, typed Parquet.
-        empty_columns = ", ".join(
-            f'CAST(NULL AS {kind}) AS "{field}"'
-            for field, kind in schema
-        )
-
-        query = f"SELECT {empty_columns} WHERE FALSE"
 
     con.execute(
         f"COPY ({query}) "
-        f"TO {sql_string(parquet_file)} "
+        f"TO {sql_string(destination)} "
         "(FORMAT PARQUET, COMPRESSION 'SNAPPY')"
     )
 
+def empty_query(schema):
+    columns = ", ".join(
+        f"CAST(NULL AS {kind}) AS {sql_identifier(name)}"
+        for name, kind in schema
+    )
+
+    return f"SELECT {columns} WHERE FALSE"
+
+def fast_csv_query(csv_path, schema):
+    """
+    Explicitly read the safe subset of Rust's
+    diagnostic CSV using DuckDB's native CSV reader.
+
+    All columns are read as VARCHAR first to prevent
+    unexpected numeric or date inference.
+    """
+    column_types = ", ".join(
+        f"{sql_string(name)}: 'VARCHAR'"
+        for name, _ in schema
+    )
+
+    return (
+        f"SELECT {typed_select(schema)} "
+        f"FROM read_csv("
+        f"{sql_string(csv_path)}, "
+        "auto_detect=false, "
+        "header=true, "
+        "delim=',', "
+        "quote='', "
+        "escape='', "
+        "nullstr='', "
+        f"columns={{{column_types}}})"
+    )
+
+def json_query(json_path, schema):
+    column_types = ", ".join(
+        f"{sql_string(name)}: "
+        f"{sql_string('BIGINT' if kind == 'BIGINT' else 'VARCHAR')}"
+        for name, kind in schema
+    )
+
+    return (
+        f"SELECT {typed_select(schema)} "
+        f"FROM read_json("
+        f"{sql_string(json_path)}, "
+        "format='newline_delimited', "
+        f"columns={{{column_types}}})"
+    )
+
+def write_report(
+    con,
+    report_name,
+    schema,
+    reports_dir,
+    scratch_dir,
+    output_dir,
+):
+    csv_path = reports_dir / f"{report_name}.csv"
+
+    destination = (
+        output_dir / report_name / "part-0.parquet"
+    )
+
+    if not csv_path.is_file():
+        raise FileNotFoundError(
+            f"Rust did not create {csv_path}"
+        )
+
+    scan_start = time.perf_counter()
+
+    has_rows, fast_safe = inspect_diagnostic_csv(
+        csv_path,
+        schema,
+    )
+
+    scan_seconds = time.perf_counter() - scan_start
+
     print(
-        f"{name}: wrote {row_count} rows to {parquet_file}",
+        f"[PROFILE] {report_name} safety scan: "
+        f"{scan_seconds:.3f} s",
         flush=True,
     )
 
+    if not has_rows:
+        start = time.perf_counter()
+
+        copy_to_parquet(
+            con,
+            empty_query(schema),
+            destination,
+        )
+
+        elapsed = time.perf_counter() - start
+
+        print(
+            f"[PROFILE] {report_name}: "
+            f"empty Parquet written in {elapsed:.3f} s",
+            flush=True,
+        )
+
+        csv_path.unlink(missing_ok=True)
+        return "empty", scan_seconds + elapsed
+
+    # -------------------------------------------------
+    # FAST PATH: Native DuckDB CSV to Parquet
+    # -------------------------------------------------
+
+    if fast_safe:
+        start = time.perf_counter()
+
+        try:
+            copy_to_parquet(
+                con,
+                fast_csv_query(csv_path, schema),
+                destination,
+            )
+
+            elapsed = time.perf_counter() - start
+
+            print(
+                f"[PROFILE] {report_name}: "
+                f"FAST CSV -> Parquet in {elapsed:.3f} s",
+                flush=True,
+            )
+
+            csv_path.unlink(missing_ok=True)
+
+            return "fast", scan_seconds + elapsed
+
+        except duckdb.Error as error:
+            # If direct CSV parsing is not supported
+            # for this input, keep exact conversion.
+            print(
+                f"[PROFILE] {report_name}: "
+                f"fast reader unavailable ({error}); "
+                "using safe fallback",
+                flush=True,
+            )
+
+            destination.unlink(missing_ok=True)
+
+    # -------------------------------------------------
+    # SAFE PATH: Byte-preserving CSV to JSON to Parquet
+    # -------------------------------------------------
+
+    json_path = scratch_dir / f"{report_name}.jsonl"
+
+    start = time.perf_counter()
+
+    row_count = diagnostic_csv_to_jsonl(
+        csv_path,
+        json_path,
+        schema,
+    )
+
+    conversion_seconds = time.perf_counter() - start
+
+    start = time.perf_counter()
+
+    copy_to_parquet(
+        con,
+        json_query(json_path, schema),
+        destination,
+    )
+
+    parquet_seconds = time.perf_counter() - start
+
+    print(
+        f"[PROFILE] {report_name}: "
+        f"SAFE conversion for {row_count} rows",
+        flush=True,
+    )
+
+    print(
+        f"[PROFILE] {report_name}: "
+        f"CSV -> JSON {conversion_seconds:.3f} s, "
+        f"Parquet {parquet_seconds:.3f} s",
+        flush=True,
+    )
+
+    json_path.unlink(missing_ok=True)
+    csv_path.unlink(missing_ok=True)
+
+    return (
+        "safe",
+        scan_seconds + conversion_seconds + parquet_seconds,
+    )
+
 def main():
+    total_start = time.perf_counter()
+
     data_dir = Path(
         os.environ.get("DATA_DIR", "/data")
     ).resolve()
@@ -185,44 +403,48 @@ def main():
         int(os.environ.get("MEM_GB", "24")),
     )
 
-    scratch_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # -------------------------------------------------
+    # PHASE 1: Rust processing
+    # -------------------------------------------------
 
-    # ================================================
-    # PHASE 1: RUN RUST
-    # ================================================
+    print("\n[PROFILE] Starting Rust engine", flush=True)
 
-    print("Running Rust engine...", flush=True)
+    rust_start = time.perf_counter()
 
     subprocess.run(
-        [
-            "/app/rust_engine",
-            str(data_dir),
-        ],
+        ["/app/rust_engine", str(data_dir)],
         cwd=scratch_dir,
         check=True,
     )
 
-    # Rust writes its diagnostic CSVs into:
-    # /scratch/out/
-    reports_dir = scratch_dir / "out"
+    rust_seconds = time.perf_counter() - rust_start
 
-    # ================================================
-    # PHASE 2: INITIALIZE DUCKDB
-    # ================================================
+    rust_peak_mb = (
+        resource.getrusage(
+            resource.RUSAGE_CHILDREN
+        ).ru_maxrss / 1024.0
+    )
+
+    print(
+        f"[PROFILE] Rust time: {rust_seconds:.3f} s",
+        flush=True,
+    )
+
+    print(
+        f"[PROFILE] Rust peak RSS: {rust_peak_mb:.1f} MiB",
+        flush=True,
+    )
+
+    # -------------------------------------------------
+    # PHASE 2: DuckDB configuration
+    # -------------------------------------------------
 
     con = duckdb.connect(database=":memory:")
 
-    con.execute(
-        f"SET threads = {ncpu}"
-    )
+    con.execute(f"SET threads = {ncpu}")
 
     con.execute(
         f"SET memory_limit = "
@@ -238,45 +460,51 @@ def main():
         "SET preserve_insertion_order = false"
     )
 
-    # ================================================
-    # PHASE 3: WRITE BOTH PARQUET REPORTS
-    # ================================================
+    # -------------------------------------------------
+    # PHASE 3: Output reports
+    # -------------------------------------------------
+
+    reports_dir = scratch_dir / "out"
+
+    report_times = {}
 
     for name, schema in SCHEMAS.items():
-        csv_path = reports_dir / f"{name}.csv"
-
-        if not csv_path.is_file():
-            raise FileNotFoundError(
-                f"Rust did not create {csv_path}"
-            )
-
-        json_path = scratch_dir / f"{name}.jsonl"
-
-        count = diagnostic_csv_to_jsonl(
-            csv_path,
-            json_path,
-            schema,
-        )
-
-        parquet_copy(
+        mode, seconds = write_report(
             con,
             name,
             schema,
-            json_path,
-            count,
+            reports_dir,
+            scratch_dir,
             output_dir,
         )
 
-        # Free temporary disk space after conversion.
-        json_path.unlink(missing_ok=True)
-        csv_path.unlink(missing_ok=True)
+        report_times[name] = (
+            mode,
+            seconds,
+        )
 
     con.close()
 
-    print(
-        "Both Parquet reports created successfully",
-        flush=True,
-    )
+    total_seconds = time.perf_counter() - total_start
+
+    # -------------------------------------------------
+    # PERFORMANCE SUMMARY
+    # -------------------------------------------------
+
+    print("\n====================================")
+    print("       OPTIMIZED PIPELINE PROFILE")
+    print("====================================")
+    print(f"Rust processing: {rust_seconds:.3f} s")
+    print(f"Rust peak RSS:   {rust_peak_mb:.1f} MiB")
+
+    for name, (mode, seconds) in report_times.items():
+        print(
+            f"{name}: {seconds:.3f} s ({mode} path)"
+        )
+
+    print(f"Python pipeline total: {total_seconds:.3f} s")
+    print("====================================")
+    print("Both Parquet reports created successfully")
 
 if __name__ == "__main__":
     main()
