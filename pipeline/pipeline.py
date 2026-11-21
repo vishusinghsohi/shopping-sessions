@@ -3,13 +3,13 @@
 """
 Shopping Sessions — optimized Parquet output.
 
-Rust performs all competition business logic.
+The selected engine performs all competition business logic.
 
 For ordinary diagnostic CSV reports:
-    Rust CSV -> DuckDB -> Parquet
+    Engine CSV -> DuckDB -> Parquet
 
 For reports containing special CSV characters:
-    Rust CSV -> safe JSON conversion -> DuckDB -> Parquet
+    Engine CSV -> safe JSON conversion -> DuckDB -> Parquet
 
 Both paths produce the required typed Parquet schemas.
 """
@@ -62,14 +62,14 @@ def typed_select(schema):
 def inspect_diagnostic_csv(path, schema):
     """
     Check whether DuckDB's fast CSV reader is safe
-    for this particular Rust report.
+    for this particular engine report.
 
     Direct CSV is used only if:
     - The header matches.
     - No carriage returns appear in data.
     - No double-quote characters appear in data.
 
-    Rust's output format never embeds commas or LF
+    The report format never embeds commas or LF
     inside fields.
 
     Special-character cases use our existing,
@@ -200,7 +200,7 @@ def empty_query(schema):
 
 def fast_csv_query(csv_path, schema):
     """
-    Explicitly read the safe subset of Rust's
+    Explicitly read the safe subset of the engine's
     diagnostic CSV using DuckDB's native CSV reader.
 
     All columns are read as VARCHAR first to prevent
@@ -255,7 +255,7 @@ def write_report(
 
     if not csv_path.is_file():
         raise FileNotFoundError(
-            f"Rust did not create {csv_path}"
+            f"Engine did not create {csv_path}"
         )
 
     scan_start = time.perf_counter()
@@ -407,34 +407,36 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------
-    # PHASE 1: Rust processing
+    # PHASE 1: Engine processing
     # -------------------------------------------------
 
-    print("\n[PROFILE] Starting Rust engine", flush=True)
+    engine = Path(os.environ.get("SESSION_ENGINE", "/app/rust_engine"))
+    engine_label = "C++" if engine.name == "cpp_engine" else "Rust"
+    print(f"\n[PROFILE] Starting {engine_label} engine", flush=True)
 
-    rust_start = time.perf_counter()
+    engine_start = time.perf_counter()
 
     subprocess.run(
-        ["/app/rust_engine", str(data_dir)],
+        [str(engine), str(data_dir)],
         cwd=scratch_dir,
         check=True,
     )
 
-    rust_seconds = time.perf_counter() - rust_start
+    engine_seconds = time.perf_counter() - engine_start
 
-    rust_peak_mb = (
+    engine_peak_mib = (
         resource.getrusage(
             resource.RUSAGE_CHILDREN
         ).ru_maxrss / 1024.0
     )
 
     print(
-        f"[PROFILE] Rust time: {rust_seconds:.3f} s",
+        f"[PROFILE] {engine_label} time: {engine_seconds:.3f} s",
         flush=True,
     )
 
     print(
-        f"[PROFILE] Rust peak RSS: {rust_peak_mb:.1f} MiB",
+        f"[PROFILE] {engine_label} peak RSS: {engine_peak_mib:.1f} MiB",
         flush=True,
     )
 
@@ -494,8 +496,8 @@ def main():
     print("\n====================================")
     print("       OPTIMIZED PIPELINE PROFILE")
     print("====================================")
-    print(f"Rust processing: {rust_seconds:.3f} s")
-    print(f"Rust peak RSS:   {rust_peak_mb:.1f} MiB")
+    print(f"{engine_label} processing: {engine_seconds:.3f} s")
+    print(f"{engine_label} peak RSS:   {engine_peak_mib:.1f} MiB")
 
     for name, (mode, seconds) in report_times.items():
         print(

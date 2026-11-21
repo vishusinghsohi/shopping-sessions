@@ -1,13 +1,91 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+## C++23 experimental engine
 
-If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
+The default Docker target in this worktree builds `cpp_engine/` with CMake,
+runs CTest during the image build, maps read-only event and click partitions,
+and uses the existing typed DuckDB export. The `cpp` target reads partitions
+into owned buffers. The `rust` target runs the tracked Rust fallback with the
+same entrypoint and export. Run these commands from the worktree root:
+
+```sh
+docker build --no-cache --platform linux/amd64 --target competition -t shopping-sessions:cpp23 .
+docker build --platform linux/amd64 --target rust -t shopping-sessions:rust-fallback .
+cargo test --locked --manifest-path rust_engine/Cargo.toml
+```
+
+For a standalone C++ build, install a C++23 compiler, CMake 3.20 or newer,
+and the nlohmann JSON development package. The JSON library is used only
+for `manifest.json`.
+
+```sh
+cmake -S cpp_engine -B scratch/cpp-build -DCMAKE_BUILD_TYPE=Release
+cmake --build scratch/cpp-build --parallel
+ctest --test-dir scratch/cpp-build --output-on-failure
+```
+
+The Windows fixture runner accepts the image in the `IMAGE` environment
+variable. With Polars installed, run the fixtures and a paired public dev
+benchmark from PowerShell:
+
+```powershell
+$env:IMAGE = 'shopping-sessions:cpp23'
+python scripts/run_fixtures.py fixtures -- python scripts/docker_run_windows.py
+python cpp_engine/benchmark.py --data path/to/dev --answer path/to/dev-answer --artifacts scratch/benchmarks --trials 3 rust=shopping-sessions:rust-fallback cpp=shopping-sessions:cpp23
+```
+
+The benchmark stages the input into a Linux-managed Docker volume, warms each
+image once, and alternates measured runs. It records staging separately and
+checks both Parquet tables after timing. Keep the logs and `summary.json` files
+under `scratch/`. Generated competition inputs and answers belong outside Git.
+The optional `--evict` flag requests Linux page-cache eviction of the staged
+files before each run. Other storage caches may still be warm.
+
+The C++ loader keeps one earliest-ingest winner per event ID, then validates
+those winners. It routes event IDs to independent shards on up to eight CPUs.
+Each shard compares full ID bytes after a hash lookup. Input buffers or
+read-only mappings own every borrowed view until the engine materializes the
+needed values. The current engine keeps winners and sorted events in memory.
+
+The [official rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md)
+define the CSV dialect, output schemas, and all attribution rules.
+
+### Local benchmark report
+
+The worktree is based on `67e3a18`. The paired Rust comparator was the locally
+optimized `shopping-sessions:competition-shared-clicks` image. Each row below
+uses a separate paired Linux Docker experiment on the same staged input.
+Wall time includes the Docker invocation and excludes staging and output
+comparison. RSS is the engine process peak.
+
+| Workload | Input bytes | Timed runs each | Rust median / RSS | Mapped C++ median / RSS | Reports |
+|---|---:|---:|---:|---:|---|
+| Public dev, 1M events | 96,210,428 | 3 | 2.06 s / 217 MiB | 2.67 s / 163 MiB | MATCH |
+| Seed 6502, 6M events and 1.5M clicks | 568,364,106 | 2 | 19.08 s / 964 MiB | 17.14 s / 986 MiB | MATCH |
+| Seed 6502, 10M events and 2.5M clicks | 946,354,118 | 2 | 78.08 s / 1,544 MiB | 66.47 s / 1,667 MiB | MATCH |
+
+The 10M run took 57.55 s to stage. Rust ranged from 65.40 to 90.76 s and
+C++ ranged from 61.49 to 71.44 s. The C++ engine wrote 34,474,093 diagnostic
+CSV bytes and about 8.1 MB of Parquet. Its largest measured stages were shard
+processing at 16.70 s, identity merge at 13.83 s, and input routing at 9.90 s.
+The typed DuckDB export took about 1.28 s. The mapped engine's process RSS
+includes file-backed input pages.
+
+Sharding and the compact winner table reduced the public dev C++ engine time
+from 2.19 to 0.98 s in the same comparison. Mapped C++ ran at 17.14 s versus
+24.63 s with buffered input on 6M. In two separate dev trials with advisory
+Linux input-cache eviction, mapped and buffered medians were 2.73 and 3.46 s.
+The parallel identity-lookup experiment reduced merge time but raised 6M wall
+time from 18.20 to 23.82 s. The default uses the earlier mapped engine.
+
+The local Docker VM had 3.68 GiB. The 30M and 60M workloads require further
+memory and runtime measurements on a larger Linux machine. These local
+measurements give no official score for the C++ branch.
 
 ## What to do first
 
-- Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
+- Read the official rules before changing the engine or export.
+- Use `cpp_engine/` for C++ processing and `pipeline/pipeline.py` for typed export.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
