@@ -1,0 +1,13 @@
+data/
+dev/
+output/
+out/
+scratch/
+.venv/
+__pycache__/
+*.pyc
+target/
+*.duckdb
+*.parquet
+fixtures.zip
+.vscode/
