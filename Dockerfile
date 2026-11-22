@@ -79,4 +79,8 @@ FROM cpp_mmap AS cpp_route_export
 ENV SESSION_PARALLEL_ROUTING=1
 ENV SESSION_CSV_SAFETY_HINT=1
 
+# Opt-in compact winner records for memory/locality experiments.
+FROM cpp_mmap AS cpp_compact_winners
+ENV SESSION_COMPACT_WINNERS=1
+
 FROM cpp_mmap AS competition
