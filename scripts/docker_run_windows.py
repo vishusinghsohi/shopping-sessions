@@ -90,7 +90,7 @@ def main():
         ]
 
         # Optional experimental sorting architecture; defaults to the baseline.
-        for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_COMPACT_WINNERS"):
+        for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_FINGERPRINTED_WINNERS"):
             if os.getenv(toggle) == "1":
                 command[-1:-1] = ["-e", f"{toggle}=1"]
 
