@@ -1,0 +1,26 @@
+name: Verify indexed campaign attribution
+
+on:
+  push:
+    branches:
+      - perf/indexed-campaign-window
+  pull_request:
+    paths:
+      - 'cpp_engine/**'
+      - 'pipeline/**'
+      - 'Dockerfile'
+      - 'run.sh'
+      - '.github/workflows/perf-validation.yml'
+
+jobs:
+  cpp-and-fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build C++ mmap runtime (includes CTest during Docker build)
+        run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Install fixture comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Verify exact Parquet outputs on all fixtures
+        run: python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
