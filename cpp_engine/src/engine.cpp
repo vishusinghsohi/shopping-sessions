@@ -18,6 +18,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -454,6 +455,41 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
     return winners;
 }
 
+// Compact alternative: a winner's raw CSV row already contains its event ID.
+// Avoid storing a redundant 16-byte string_view for every unique winning event.
+// The first CSV field is only extracted when a hash-table probe collides.
+std::vector<Winner> choose_winners_compact(const std::vector<View>& input) {
+    if (input.size() >= std::numeric_limits<Key>::max()) {
+        throw std::overflow_error("event shard index overflow");
+    }
+    const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
+    std::vector<Key> buckets(bucket_count, 0);
+    std::vector<Winner> winners;
+    winners.reserve(input.size());
+    for (const auto row : input) {
+        const auto fields = parse_csv<7>(row);
+        if (!fields || (*fields)[0].empty()) continue;
+        const auto ingest = timestamp((*fields)[3]);
+        if (!ingest) continue;
+        const View id = (*fields)[0];
+        auto slot = std::hash<View>{}(id) & (bucket_count - 1);
+        while (buckets[slot] != 0 &&
+               routing_id(winners[buckets[slot] - 1].line) != id) {
+            slot = (slot + 1) & (bucket_count - 1);
+        }
+        if (buckets[slot] == 0) {
+            winners.push_back({row, *ingest});
+            buckets[slot] = static_cast<Key>(winners.size());
+        } else if (*ingest < winners[buckets[slot] - 1].ingest) {
+            winners[buckets[slot] - 1] = {row, *ingest};
+        }
+    }
+    return winners;
+}
+
+static_assert(sizeof(Winner) < sizeof(IndexedWinner),
+              "compact winner must use less memory than indexed winner");
+
 struct EventShard {
     std::vector<View> users;
     std::vector<Event> events;
@@ -464,21 +500,43 @@ struct EventShard {
 EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
     EventShard shard;
     auto start = Clock::now();
-    const auto winners = choose_winners(rows);
-    std::vector<View>().swap(rows);
-    shard.dedup_seconds = seconds(start);
+    const auto* mode = std::getenv("SESSION_COMPACT_WINNERS");
+    const bool compact = mode && View(mode) == "1";
 
-    start = Clock::now();
-    std::unordered_map<View, Key> users;
-    shard.events.reserve(winners.size());
-    for (const auto& winner : winners) {
-        if (const auto valid = validate_event(winner.record, window, products, unknown)) {
-            const auto [key, inserted] = users.try_emplace(valid->user, static_cast<Key>(shard.users.size()));
-            if (inserted) {
-                shard.users.push_back(valid->user);
+    // Winner vectors remain in scope until validation completes; row views are
+    // borrowed from immutable mapped CSV partitions, not temporary strings.
+    const auto validate_winners = [&](const auto& winners) {
+        std::unordered_map<View, Key> users;
+        shard.events.reserve(winners.size());
+        for (const auto& entry : winners) {
+            const Winner& record = [&]() -> const Winner& {
+                if constexpr (std::is_same_v<std::decay_t<decltype(entry)>, Winner>) {
+                    return entry;
+                } else {
+                    return entry.record;
+                }
+            }();
+            if (const auto valid = validate_event(record, window, products, unknown)) {
+                const auto [key, inserted] = users.try_emplace(
+                    valid->user, static_cast<Key>(shard.users.size()));
+                if (inserted) shard.users.push_back(valid->user);
+                shard.events.push_back({
+                    valid->time, valid->revenue, key->second, valid->category});
             }
-            shard.events.push_back({valid->time, valid->revenue, key->second, valid->category});
         }
+    };
+    if (compact) {
+        const auto winners = choose_winners_compact(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
+    } else {
+        const auto winners = choose_winners(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
     }
     shard.validate_seconds = seconds(start);
     return shard;
