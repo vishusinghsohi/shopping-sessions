@@ -48,4 +48,5 @@ jobs:
           MEM: '8g'
           SORT_TEST_EVENTS: '2000000'
           SORT_TEST_MODE: route_export
+          SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
