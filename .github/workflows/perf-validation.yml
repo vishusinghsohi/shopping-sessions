@@ -7,6 +7,7 @@ on:
       - perf/parallel-event-sort
       - perf/route-and-export-profile
       - perf/canonical-user-partition
+      - perf/fused-ingest-dedup
   pull_request:
     paths:
       - 'cpp_engine/**'
@@ -63,5 +64,30 @@ jobs:
           MEM: '8g'
           SORT_TEST_EVENTS: '2000000'
           SORT_TEST_MODE: canonical_users
+          SORT_TEST_TRIALS: '3'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+
+      - name: Verify fused ingestion on all official fixtures
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_FUSED_EVENTS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Verify 2M events with cross-chunk duplicates and fused ingestion
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: fused_ingest
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '2'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Benchmark fused ingestion with canonical-user processing
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: fused_canonical
+          SORT_TEST_DUPLICATES: '1'
           SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
