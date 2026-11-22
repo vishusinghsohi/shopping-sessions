@@ -83,4 +83,13 @@ ENV SESSION_CSV_SAFETY_HINT=1
 FROM cpp_mmap AS cpp_canonical_users
 ENV SESSION_CANONICAL_PARTITIONS=1
 
+# Experimental fused parsing and earliest-ingest deduplication.
+FROM cpp_mmap AS cpp_fused_ingest
+ENV SESSION_FUSED_EVENTS=1
+
+# Combine fused ingestion with canonical-user partitioned processing.
+FROM cpp_mmap AS cpp_fused_canonical
+ENV SESSION_FUSED_EVENTS=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+
 FROM cpp_mmap AS competition
