@@ -1,0 +1,42 @@
+name: 60M dedup bucket fingerprint A/B
+
+on:
+  push:
+    branches:
+      - perf/bucket-fingerprint-dedup
+  workflow_dispatch:
+
+jobs:
+  benchmark-60m:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record runner CPU memory and disk
+        run: |
+          nproc
+          free -h
+          df -h .
+      - name: Build unchanged competition C++ engine and CTest
+        run: docker build --target competition -t shopping-sessions:latest .
+      - name: Install exact Parquet comparison dependency
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Validate all 36 official fixtures using bucket fingerprints
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_BUCKET_FINGERPRINTS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Compare 60M synthetic duplicate-heavy events (three alternating trials)
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: bucket_fingerprint
+          SORT_TEST_EVENTS: '60000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '3'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Record disk availability
+        if: always()
+        run: df -h .

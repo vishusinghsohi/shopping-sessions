@@ -497,6 +497,51 @@ std::vector<FingerprintedWinner> choose_winners_fingerprinted(
     return winners;
 }
 
+// Experiment: keep the inexpensive 32-bit fingerprint in each bucket itself
+// rather than requiring a random read of a winner record for every collision.
+// A matching fingerprint is never sufficient: compare the full event ID too.
+std::vector<Winner> choose_winners_bucket_fingerprints(
+    const std::vector<View>& input) {
+    if (input.size() >= std::numeric_limits<Key>::max()) {
+        throw std::overflow_error("event shard index overflow");
+    }
+    const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
+    // High 32 bits: hash fingerprint; low 32 bits: winner index+1 (0=empty).
+    std::vector<std::uint64_t> buckets(bucket_count, 0);
+    std::vector<Winner> winners;
+    winners.reserve(input.size());
+    const auto mask = bucket_count - 1;
+    for (const auto row : input) {
+        const auto fields = parse_csv<7>(row);
+        if (!fields || (*fields)[0].empty()) continue;
+        const auto ingest = timestamp((*fields)[3]);
+        if (!ingest) continue;
+        const View id = (*fields)[0];
+        const auto hash = std::hash<View>{}(id);
+        const auto fingerprint = static_cast<std::uint32_t>(hash >> 32);
+        auto slot = hash & mask;
+        while (true) {
+            const auto bucket = buckets[slot];
+            const Key index = static_cast<Key>(bucket);
+            if (!index) {
+                winners.push_back({row, *ingest});
+                buckets[slot] = (static_cast<std::uint64_t>(fingerprint) << 32) |
+                                static_cast<std::uint64_t>(winners.size());
+                break;
+            }
+            if (static_cast<std::uint32_t>(bucket >> 32) == fingerprint &&
+                routing_id(winners[index - 1].line) == id) {
+                if (*ingest < winners[index - 1].ingest) {
+                    winners[index - 1] = {row, *ingest};
+                }
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+    return winners;
+}
+
 struct EventShard {
     std::vector<View> users;
     std::vector<Event> events;
@@ -524,7 +569,26 @@ EventShard load_shard(std::vector<View> rows, Window window,
             }
         }
     };
-    if (fingerprinted) {
+    const auto* bucket_mode = std::getenv("SESSION_BUCKET_FINGERPRINTS");
+    if (bucket_mode && View(bucket_mode) == "1") {
+        const auto winners = choose_winners_bucket_fingerprints(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        // Use one common validation implementation without duplicating
+        // the map or changing first-occurrence user-ID assignment order.
+        std::unordered_map<View, Key> users;
+        shard.events.reserve(winners.size());
+        for (const auto& winner : winners) {
+            if (const auto valid = validate_event(winner, window, products, unknown)) {
+                const auto [it, inserted] = users.try_emplace(
+                    valid->user, static_cast<Key>(shard.users.size()));
+                if (inserted) shard.users.push_back(valid->user);
+                shard.events.push_back({
+                    valid->time, valid->revenue, it->second, valid->category});
+            }
+        }
+    } else if (fingerprinted) {
         const auto winners = choose_winners_fingerprinted(rows);
         std::vector<View>().swap(rows);
         shard.dedup_seconds = seconds(start);
