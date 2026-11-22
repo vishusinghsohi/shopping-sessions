@@ -1,0 +1,44 @@
+name: Direct parallel routing A/B
+
+on:
+  push:
+    branches:
+      - perf/direct-parallel-route
+
+jobs:
+  direct-route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build C++ engine with CTest
+        run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Install Parquet comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Verify 36 fixtures with direct parallel routing and canonical processing
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_DIRECT_ROUTING: '1'
+          SESSION_CANONICAL_PARTITIONS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: A/B 2M direct routing versus serial routing (both canonical users)
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: direct_canonical
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '3'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: A/B 20M direct routing versus serial routing (both canonical users)
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: direct_canonical
+          SORT_TEST_EVENTS: '20000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '2'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py

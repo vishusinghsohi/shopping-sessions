@@ -83,4 +83,9 @@ ENV SESSION_CSV_SAFETY_HINT=1
 FROM cpp_mmap AS cpp_canonical_users
 ENV SESSION_CANONICAL_PARTITIONS=1
 
+# Experimental lock-free direct parallel router plus canonical-user processing.
+FROM cpp_mmap AS cpp_direct_canonical
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+
 FROM cpp_mmap AS competition
