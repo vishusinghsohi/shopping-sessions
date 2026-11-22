@@ -14,7 +14,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "docker_run_windows.py"
 COMPARE = ROOT / "scripts" / "compare.py"
-COUNT = 200_000
+COUNT = int(os.environ.get("SORT_TEST_EVENTS", "200000"))
 
 
 def main():
@@ -64,7 +64,7 @@ def main():
                            check=True, env=env)
         subprocess.run([sys.executable, str(COMPARE), str(baseline), str(parallel)],
                        check=True)
-        print("PASS: 200k-event baseline and parallel-sort Parquet outputs match", flush=True)
+        print(f"PASS: {COUNT:,}-event baseline and parallel-sort Parquet outputs match", flush=True)
 
 
 if __name__ == "__main__":
