@@ -1,5 +1,36 @@
 # Shopping Sessions
 
+## Competition submission (optimized C++ build)
+
+The default `competition` Docker target enables the three validated
+experimental optimizations without needing to supply environment flags:
+
+- `SESSION_DIRECT_ROUTING=1`: lock-free two-pass event routing into
+  preallocated shard ranges
+- `SESSION_FINGERPRINTED_WINNERS=1`: fingerprint-assisted shard-local
+  earliest-ingestion deduplication
+- `SESSION_CANONICAL_PARTITIONS=1`: parallel canonical-user sessionization,
+  user aggregation, and campaign attribution
+
+Build the Docker target specified by the competition rules:
+
+```sh
+docker build --platform linux/amd64 --target competition -t shopping-sessions:competition .
+```
+
+The `run.sh` entrypoint, required `/data`, `/output`, and `/scratch`
+mounts, and typed Parquet output are unchanged. The actual competition
+image is verified against all 36 official fixtures in GitHub Actions,
+without manually setting the experimental flags.
+
+The optimized architecture matched exact Parquet output for 2M and 20M
+synthetic events, including 10% duplicate IDs; it reduced the 20M median
+pipeline runtime in GitHub's 4-vCPU Linux CI. **It has not yet been scored
+on the official 60M-event, 8-vCPU, 24-GB competition workload.** The
+previous official score (23 seconds) is not a new score for this release.
+
+---
+
 ## C++23 experimental engine
 
 The default Docker target in this worktree builds `cpp_engine/` with CMake,
