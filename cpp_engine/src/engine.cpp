@@ -497,7 +497,7 @@ std::vector<EventShard> fused_ingest_events(
     Window window, const Catalog& products, Key unknown) {
     struct Task {
         View chunk;
-        std::vector<std::vector<IndexedWinner>> winners;
+        std::vector<IndexedWinner> winners;
     };
     std::vector<Task> tasks;
     for (const auto& file : storage) {
@@ -519,6 +519,9 @@ std::vector<EventShard> fused_ingest_events(
         }
     }
 
+    // Use flat integer bucket arrays, not node-allocated unordered_map.
+    // Counting row delimiters gives a hard upper bound on the number of
+    // distinct winners in a task, allowing a single fixed table allocation.
     const auto parse_start = Clock::now();
     std::atomic<std::size_t> next{0};
     std::vector<std::exception_ptr> failures(workers);
@@ -528,28 +531,36 @@ std::vector<EventShard> fused_ingest_events(
                 const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
                 if (index >= tasks.size()) break;
                 auto& task = tasks[index];
-                task.winners.resize(workers);
-                std::vector<std::unordered_map<View, std::size_t>> indexes(workers);
+                const auto row_count = static_cast<std::size_t>(
+                    std::count(task.chunk.begin(), task.chunk.end(), '\n')) +
+                    (task.chunk.back() != '\n');
+                if (row_count >= std::numeric_limits<Key>::max()) {
+                    throw std::overflow_error("event task index overflow");
+                }
+                const auto bucket_count = std::bit_ceil(row_count + row_count / 3 + 2);
+                std::vector<Key> buckets(bucket_count, 0);
+                task.winners.reserve(row_count);
+
                 View remaining = task.chunk;
                 while (!remaining.empty()) {
                     const auto newline = remaining.find('\n');
                     const View line = newline == View::npos ? remaining : remaining.substr(0, newline);
                     remaining = newline == View::npos ? View{} : remaining.substr(newline + 1);
-                    // Match the original: the winner may be invalid after
-                    // deduplication, but invalid ingest timestamps are skipped.
                     const auto fields = parse_csv<7>(line);
                     if (!fields || (*fields)[0].empty()) continue;
                     const auto ingest = timestamp((*fields)[3]);
                     if (!ingest) continue;
                     const View id = (*fields)[0];
-                    const auto shard = std::hash<View>{}(routing_id(line)) % workers;
-                    auto& winners = task.winners[shard];
-                    auto& index_map = indexes[shard];
-                    const auto [it, inserted] = index_map.try_emplace(id, winners.size());
-                    if (inserted) {
-                        winners.push_back({id, {line, *ingest}});
-                    } else if (*ingest < winners[it->second].record.ingest) {
-                        winners[it->second].record = {line, *ingest};
+                    auto slot = std::hash<View>{}(id) & (bucket_count - 1);
+                    while (buckets[slot] != 0 &&
+                           task.winners[buckets[slot] - 1].id != id) {
+                        slot = (slot + 1) & (bucket_count - 1);
+                    }
+                    if (buckets[slot] == 0) {
+                        task.winners.push_back({id, {line, *ingest}});
+                        buckets[slot] = static_cast<Key>(task.winners.size());
+                    } else if (*ingest < task.winners[buckets[slot] - 1].record.ingest) {
+                        task.winners[buckets[slot] - 1].record = {line, *ingest};
                     }
                 }
             }
@@ -569,22 +580,39 @@ std::vector<EventShard> fused_ingest_events(
     profile("fused_parse_local_dedup_seconds", parse_start);
 
     const auto reconcile_start = Clock::now();
-    std::vector<std::vector<IndexedWinner>> winners_by_shard(workers);
-    std::vector<std::unordered_map<View, std::size_t>> indexes(workers);
-    for (auto& task : tasks) {
-        for (std::size_t shard = 0; shard < workers; ++shard) {
-            auto& combined = winners_by_shard[shard];
-            auto& global_index = indexes[shard];
-            for (const auto& candidate : task.winners[shard]) {
-                const auto [it, inserted] = global_index.try_emplace(candidate.id, combined.size());
-                if (inserted) {
-                    combined.push_back(candidate);
-                } else if (candidate.record.ingest < combined[it->second].record.ingest) {
-                    combined[it->second].record = candidate.record;
-                }
-            }
-            std::vector<IndexedWinner>().swap(task.winners[shard]);
+    std::vector<std::size_t> shard_counts(workers, 0);
+    for (const auto& task : tasks) {
+        for (const auto& candidate : task.winners) {
+            ++shard_counts[std::hash<View>{}(routing_id(candidate.record.line)) % workers];
         }
+    }
+    std::vector<std::vector<IndexedWinner>> winners_by_shard(workers);
+    std::vector<std::vector<Key>> shard_buckets(workers);
+    for (std::size_t shard = 0; shard < workers; ++shard) {
+        if (shard_counts[shard] >= std::numeric_limits<Key>::max()) {
+            throw std::overflow_error("event shard index overflow");
+        }
+        winners_by_shard[shard].reserve(shard_counts[shard]);
+        shard_buckets[shard].resize(std::bit_ceil(
+            shard_counts[shard] + shard_counts[shard] / 3 + 2), 0);
+    }
+    for (auto& task : tasks) {
+        for (const auto& candidate : task.winners) {
+            const auto shard = std::hash<View>{}(routing_id(candidate.record.line)) % workers;
+            auto& combined = winners_by_shard[shard];
+            auto& buckets = shard_buckets[shard];
+            auto slot = std::hash<View>{}(candidate.id) & (buckets.size() - 1);
+            while (buckets[slot] != 0 && combined[buckets[slot] - 1].id != candidate.id) {
+                slot = (slot + 1) & (buckets.size() - 1);
+            }
+            if (buckets[slot] == 0) {
+                combined.push_back(candidate);
+                buckets[slot] = static_cast<Key>(combined.size());
+            } else if (candidate.record.ingest < combined[buckets[slot] - 1].record.ingest) {
+                combined[buckets[slot] - 1].record = candidate.record;
+            }
+        }
+        std::vector<IndexedWinner>().swap(task.winners);
     }
     profile("fused_global_winner_merge_seconds", reconcile_start);
 
