@@ -96,6 +96,12 @@ ENV SESSION_FINGERPRINTED_WINNERS=1
 
 # Competition submission uses the verified optimized C++ path.
 # Defaults remain overrideable through Docker environment at runtime.
+FROM cpp_mmap AS cpp_flat_shard_users
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+ENV SESSION_FINGERPRINTED_WINNERS=1
+ENV SESSION_FLAT_SHARD_USERS=1
+
 FROM cpp_mmap AS competition
 ENV SESSION_DIRECT_ROUTING=1
 ENV SESSION_CANONICAL_PARTITIONS=1
