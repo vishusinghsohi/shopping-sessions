@@ -6,7 +6,7 @@ on:
       - perf/indexed-campaign-window
       - perf/parallel-event-sort
       - perf/route-and-export-profile
-      - perf/compact-winner-records
+      - perf/fingerprinted-winner-layout
   pull_request:
     paths:
       - 'cpp_engine/**'
@@ -51,17 +51,17 @@ jobs:
           SORT_TEST_MODE: route_export
           SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
-      - name: Verify compact dedup winner records on official fixtures
+      - name: Verify fingerprinted dedup winner records on official fixtures
         env:
           CPUS: '4'
           MEM: '8g'
-          SESSION_COMPACT_WINNERS: '1'
+          SESSION_FINGERPRINTED_WINNERS: '1'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
-      - name: Benchmark 2M-event baseline versus compact dedup winners
+      - name: Benchmark 2M-event baseline versus fingerprinted dedup winners
         env:
           CPUS: '4'
           MEM: '8g'
           SORT_TEST_EVENTS: '2000000'
-          SORT_TEST_MODE: compact_winners
+          SORT_TEST_MODE: fingerprinted_winners
           SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
