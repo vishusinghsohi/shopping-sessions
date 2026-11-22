@@ -64,7 +64,7 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_COMPACT_WINNERS"):
                     env.pop(toggle, None)
                 if optimized:
                     if os.environ.get("SORT_TEST_MODE") == "route_export":
