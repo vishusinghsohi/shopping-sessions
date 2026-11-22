@@ -716,7 +716,8 @@ std::vector<std::vector<View>> route_events_direct(
 }
 
 std::vector<Event> load_events(Input& input, const Path& data, Window window, Identities& ids,
-                               const Catalog& products, Key unknown) {
+                               const Catalog& products, Key unknown,
+                               std::vector<std::vector<Event>>* canonical_partitions = nullptr) {
     const auto files = partitions(data / "events");
     std::vector<Partition> storage;
     storage.reserve(files.size());
@@ -786,7 +787,18 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
 
     start = Clock::now();
     std::vector<Event> events;
-    events.reserve(count);
+    if (canonical_partitions) {
+        canonical_partitions->resize(workers);
+        // The old path creates a global event vector, then scans and copies
+        // it again to partition by canonical user. Directly build the final
+        // user partitions during identity resolution instead.
+        const auto average = count / workers;
+        for (auto& partition : *canonical_partitions) {
+            partition.reserve(average + average / 4 + 1);
+        }
+    } else {
+        events.reserve(count);
+    }
     for (auto& shard : shards) {
         std::vector<Key> keys;
         keys.reserve(shard.users.size());
@@ -795,7 +807,11 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
         }
         for (auto event : shard.events) {
             event.user = keys[event.user];
-            events.push_back(event);
+            if (canonical_partitions) {
+                (*canonical_partitions)[static_cast<std::size_t>(event.user) % workers].push_back(event);
+            } else {
+                events.push_back(event);
+            }
         }
         std::vector<Event>().swap(shard.events);
     }
@@ -1068,7 +1084,8 @@ struct ParallelUserResult {
 
 ParallelUserResult process_user_partitions(
     std::vector<Event> events, std::vector<Click> clicks,
-    const Names& categories, Key organic, std::size_t campaign_count) {
+    const Names& categories, Key organic, std::size_t campaign_count,
+    std::vector<std::vector<Event>>* canonical_events = nullptr) {
     const std::size_t workers = worker_budget();
     const auto route_start = Clock::now();
     std::vector<UserPartition> partitions(workers);
@@ -1077,13 +1094,21 @@ ParallelUserResult process_user_partitions(
         // This maps the same canonical user to the same worker for both tables.
         return static_cast<std::size_t>(canonical) % workers;
     };
-    for (const auto& event : events) ++event_counts[shard_for(event.user)];
+    if (!canonical_events) {
+        for (const auto& event : events) ++event_counts[shard_for(event.user)];
+    }
     for (const auto& click : clicks) ++click_counts[shard_for(click.user)];
     for (std::size_t i = 0; i < workers; ++i) {
-        partitions[i].events.reserve(event_counts[i]);
+        if (canonical_events) {
+            partitions[i].events = std::move((*canonical_events)[i]);
+        } else {
+            partitions[i].events.reserve(event_counts[i]);
+        }
         partitions[i].clicks.reserve(click_counts[i]);
     }
-    for (const auto& event : events) partitions[shard_for(event.user)].events.push_back(event);
+    if (!canonical_events) {
+        for (const auto& event : events) partitions[shard_for(event.user)].events.push_back(event);
+    }
     for (const auto& click : clicks) partitions[shard_for(click.user)].clicks.push_back(click);
     // Free the original, unpartitioned collections before sorting.
     std::vector<Event>().swap(events);
@@ -1365,9 +1390,14 @@ void run(const Path& data, const Path& reports) {
     Catalog products;
     load_catalog(input, data / "products.csv", products);
     const Key unknown = products.labels.intern("unknown");
-    auto events = load_events(input, data, window, identities, products, unknown);
+    const auto* fused_flag = std::getenv("SESSION_FUSED_CANONICAL_MERGE");
     const auto* partition_flag = std::getenv("SESSION_CANONICAL_PARTITIONS");
-    if (partition_flag && View(partition_flag) == "1" && worker_budget() > 1) {
+    const bool partition_enabled = partition_flag && View(partition_flag) == "1" && worker_budget() > 1;
+    const bool fused = fused_flag && View(fused_flag) == "1" && partition_enabled;
+    std::vector<std::vector<Event>> canonical_event_shards;
+    auto events = load_events(input, data, window, identities, products, unknown,
+                              fused ? &canonical_event_shards : nullptr);
+    if (partition_enabled) {
         // Global event deduplication and canonical identity resolution are
         // complete; click deduplication also finishes before partitioning.
         Catalog campaigns;
@@ -1375,12 +1405,18 @@ void run(const Path& data, const Path& reports) {
         Clicks clicks;
         load_clicks(input, data, window, identities, campaigns, clicks);
         const Key organic = campaigns.insert("organic", "organic");
-        const Integer event_count = static_cast<Integer>(events.size());
+        std::size_t valid_events = events.size();
+        if (fused) {
+            valid_events = 0;
+            for (const auto& shard : canonical_event_shards) valid_events += shard.size();
+        }
+        const Integer event_count = static_cast<Integer>(valid_events);
 
         start = Clock::now();
         auto grouped = process_user_partitions(
             std::move(events), std::move(clicks.records),
-            products.labels, organic, campaigns.ids.size());
+            products.labels, organic, campaigns.ids.size(),
+            fused ? &canonical_event_shards : nullptr);
         profile("canonical_partition_total_seconds", start);
 
         start = Clock::now();

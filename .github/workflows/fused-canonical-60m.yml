@@ -1,0 +1,45 @@
+name: 60M fused canonical comparison
+
+on:
+  push:
+    branches:
+      - perf/fused-canonical-merge
+  workflow_dispatch:
+
+jobs:
+  compare-60m:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record available runner resources
+        run: |
+          echo "CPU count:"
+          nproc
+          echo "Memory:"
+          free -h
+          echo "Disk:"
+          df -h .
+      - name: Build unchanged competition image and CTest
+        run: docker build --target competition -t shopping-sessions:latest .
+      - name: Install exact Parquet comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Verify 36 official fixtures with fused canonical merge enabled
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_FUSED_CANONICAL_MERGE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Compare 60M synthetic events with 10pct duplicate IDs (three alternating trials)
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: fused_merge
+          SORT_TEST_EVENTS: '60000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '3'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Record post-run disk availability
+        if: always()
+        run: df -h .
