@@ -82,6 +82,12 @@ def main():
                 if match is None:
                     raise RuntimeError("Missing engine timing:\\n" + result.stdout[-2500:])
                 internal = float(match[1])
+                if os.environ.get("SORT_TEST_PROFILE") == "1":
+                    for line in result.stdout.splitlines():
+                        if (line.startswith("[INNER] ") or
+                            line.startswith("[PROFILE] C++ peak RSS:") or
+                            line.startswith("[PROFILE] C++ time:")):
+                            print(f"PROFILE {label} trial={trial} {line}", flush=True)
                 measurements[label].append(internal)
                 outputs[label] = dest
                 print(f"{label} trial={trial} pipeline={internal:.4f}s host={wall:.4f}s", flush=True)
