@@ -485,6 +485,144 @@ EventShard load_shard(std::vector<View> rows, Window window, const Catalog& prod
     return shard;
 }
 
+// Fused experimental pipeline: each LF-aligned input task parses rows,
+// selects its earliest-ingest winner for each event ID, and immediately routes
+// the compact winners to their global hash shard. We never materialize the
+// full event-row routing vectors in this mode.
+//
+// Tasks are merged in original file/chunk order so earliest-winner ties and
+// first-seen order retain the same semantics as choose_winners().
+std::vector<EventShard> fused_ingest_events(
+    const std::vector<Partition>& storage, std::size_t workers,
+    Window window, const Catalog& products, Key unknown) {
+    struct Task {
+        View chunk;
+        std::vector<std::vector<IndexedWinner>> winners;
+    };
+    std::vector<Task> tasks;
+    for (const auto& file : storage) {
+        const View full = file.view();
+        const auto header = full.find('\n');
+        if (header == View::npos) continue;
+        const View body = full.substr(header + 1);
+        if (body.empty()) continue;
+        const std::size_t target = std::max<std::size_t>(1, body.size() / (workers * 2));
+        std::size_t begin = 0;
+        while (begin < body.size()) {
+            std::size_t end = std::min(body.size(), begin + target);
+            if (end < body.size()) {
+                const auto newline = body.find('\n', end);
+                end = newline == View::npos ? body.size() : newline + 1;
+            }
+            tasks.push_back({body.substr(begin, end - begin), {}});
+            begin = end;
+        }
+    }
+
+    const auto parse_start = Clock::now();
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> failures(workers);
+    const auto parse_task = [&](std::size_t worker) {
+        try {
+            while (true) {
+                const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= tasks.size()) break;
+                auto& task = tasks[index];
+                task.winners.resize(workers);
+                std::vector<std::unordered_map<View, std::size_t>> indexes(workers);
+                View remaining = task.chunk;
+                while (!remaining.empty()) {
+                    const auto newline = remaining.find('\n');
+                    const View line = newline == View::npos ? remaining : remaining.substr(0, newline);
+                    remaining = newline == View::npos ? View{} : remaining.substr(newline + 1);
+                    // Match the original: the winner may be invalid after
+                    // deduplication, but invalid ingest timestamps are skipped.
+                    const auto fields = parse_csv<7>(line);
+                    if (!fields || (*fields)[0].empty()) continue;
+                    const auto ingest = timestamp((*fields)[3]);
+                    if (!ingest) continue;
+                    const View id = (*fields)[0];
+                    const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                    auto& winners = task.winners[shard];
+                    auto& index_map = indexes[shard];
+                    const auto [it, inserted] = index_map.try_emplace(id, winners.size());
+                    if (inserted) {
+                        winners.push_back({id, {line, *ingest}});
+                    } else if (*ingest < winners[it->second].record.ingest) {
+                        winners[it->second].record = {line, *ingest};
+                    }
+                }
+            }
+        } catch (...) {
+            failures[worker] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(workers - 1);
+        for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(parse_task, i);
+        parse_task(0);
+    }
+    for (const auto& error : failures) {
+        if (error) std::rethrow_exception(error);
+    }
+    profile("fused_parse_local_dedup_seconds", parse_start);
+
+    const auto reconcile_start = Clock::now();
+    std::vector<std::vector<IndexedWinner>> winners_by_shard(workers);
+    std::vector<std::unordered_map<View, std::size_t>> indexes(workers);
+    for (auto& task : tasks) {
+        for (std::size_t shard = 0; shard < workers; ++shard) {
+            auto& combined = winners_by_shard[shard];
+            auto& global_index = indexes[shard];
+            for (const auto& candidate : task.winners[shard]) {
+                const auto [it, inserted] = global_index.try_emplace(candidate.id, combined.size());
+                if (inserted) {
+                    combined.push_back(candidate);
+                } else if (candidate.record.ingest < combined[it->second].record.ingest) {
+                    combined[it->second].record = candidate.record;
+                }
+            }
+            std::vector<IndexedWinner>().swap(task.winners[shard]);
+        }
+    }
+    profile("fused_global_winner_merge_seconds", reconcile_start);
+
+    const auto validate_start = Clock::now();
+    std::vector<EventShard> shards(workers);
+    std::vector<std::exception_ptr> validation_failures(workers);
+    const auto validate = [&](std::size_t shard_id) {
+        try {
+            auto& shard = shards[shard_id];
+            const auto& winners = winners_by_shard[shard_id];
+            std::unordered_map<View, Key> users;
+            shard.events.reserve(winners.size());
+            for (const auto& entry : winners) {
+                if (const auto valid = validate_event(entry.record, window, products, unknown)) {
+                    const auto [it, inserted] = users.try_emplace(
+                        valid->user, static_cast<Key>(shard.users.size()));
+                    if (inserted) shard.users.push_back(valid->user);
+                    shard.events.push_back({
+                        valid->time, valid->revenue, it->second, valid->category});
+                }
+            }
+        } catch (...) {
+            validation_failures[shard_id] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(workers - 1);
+        for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(validate, i);
+        validate(0);
+    }
+    for (const auto& error : validation_failures) {
+        if (error) std::rethrow_exception(error);
+    }
+    profile("fused_validate_seconds", validate_start);
+    return shards;
+}
+
 // Opt-in parallel routing. Split each source partition on LF boundaries, so
 // every physical row is visited exactly once. Per-task outputs avoid locks in
 // the hot loop. Merge tasks in file order to preserve input row ordering.
@@ -583,6 +721,12 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
+    const auto* fused_flag = std::getenv("SESSION_FUSED_EVENTS");
+    const bool fused = fused_flag && View(fused_flag) == "1";
+    std::vector<EventShard> shards;
+    if (fused) {
+        shards = fused_ingest_events(storage, workers, window, products, unknown);
+    } else {
     std::vector<std::vector<View>> routed;
     if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
         setting && View(setting) == "1" && workers > 1) {
@@ -599,7 +743,7 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     profile("event_route_seconds", start);
 
     start = Clock::now();
-    std::vector<EventShard> shards(workers);
+    shards.resize(workers);
     std::vector<std::exception_ptr> failures(workers);
     {
         std::vector<std::jthread> threads;
@@ -622,6 +766,7 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
         }
     }
     profile("event_shards_wall_seconds", start);
+    }
     std::size_t count = 0;
     double dedup = 0;
     double validate = 0;
