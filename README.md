@@ -1,5 +1,27 @@
 # Shopping Sessions
 
+## 60M-validated bucket-fingerprint deduplication (competition target)
+
+The `competition` image now also enables `SESSION_BUCKET_FINGERPRINTS=1`.
+This stores a 32-bit hash fingerprint alongside a 32-bit one-based winner index
+in each open-addressing bucket. Nonmatching hash fingerprints can skip the
+random winner-record lookup; a matching fingerprint still requires full event-ID
+comparison, preserving deduplication semantics. Shard winner records are smaller,
+although the larger buckets can increase total peak memory.
+
+This optimization passed C++ CTest, all 36 official fixtures, and exact typed
+Parquet output comparisons on 2M, 20M and 60M synthetic events with 10%
+duplicate IDs. On 60M, three paired trials in 4-vCPU GitHub CI (Docker 8-GiB
+limit) reduced median pipeline time from **12.792 seconds** to **11.904 seconds**
+(~6.9% reduction). Peak C++ RSS rose from ~6158 MiB to ~6258 MiB.
+Evidence:
+https://github.com/vishusinghsohi/shopping-sessions/actions/runs/44986021220
+
+**This is synthetic 4-vCPU CI evidence, not an official competition score.**
+The last confirmed official runtime before this change was 19.6712 seconds.
+A new scored submission is needed to measure it on the competition's 8-vCPU,
+24-GB hidden workload.
+
 ## 60M-validated canonical identity merge (competition target)
 
 The `competition` Docker target now enables `SESSION_FUSED_CANONICAL_MERGE=1`
