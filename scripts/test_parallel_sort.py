@@ -75,9 +75,14 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS", "SESSION_FUSED_CANONICAL_MERGE"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS", "SESSION_FUSED_CANONICAL_MERGE", "SESSION_BUCKET_FINGERPRINTS"):
                     env.pop(toggle, None)
                 mode = os.environ.get("SORT_TEST_MODE", "")
+                if mode == "bucket_fingerprint":
+                    env["SESSION_DIRECT_ROUTING"] = "1"
+                    env["SESSION_CANONICAL_PARTITIONS"] = "1"
+                    env["SESSION_FINGERPRINTED_WINNERS"] = "1"
+                    env["SESSION_FUSED_CANONICAL_MERGE"] = "1"
                 if mode == "fused_merge":
                     env["SESSION_DIRECT_ROUTING"] = "1"
                     env["SESSION_CANONICAL_PARTITIONS"] = "1"
@@ -89,7 +94,9 @@ def main():
                     # the shard-local deduplication algorithm differs.
                     env["SESSION_DIRECT_ROUTING"] = "1"
                 if optimized:
-                    if mode == "fused_merge":
+                    if mode == "bucket_fingerprint":
+                        env["SESSION_BUCKET_FINGERPRINTS"] = "1"
+                    elif mode == "fused_merge":
                         env["SESSION_FUSED_CANONICAL_MERGE"] = "1"
                     elif mode == "fingerprint_direct":
                         env["SESSION_FINGERPRINTED_WINNERS"] = "1"
