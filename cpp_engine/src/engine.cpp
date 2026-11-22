@@ -464,6 +464,34 @@ struct FingerprintedWinner {
 };
 static_assert(sizeof(FingerprintedWinner) < sizeof(IndexedWinner));
 
+// Deduplication only needs the event ID and ingestion time. Validate the
+// *entire* seven-column CSV shape with precisely the same quoting rules as
+// parse_csv<7>, but avoid constructing seven string_view descriptors per row.
+std::optional<std::pair<View, View>> dedup_id_ingest(View row) {
+    if (row.empty()) return std::nullopt;
+    View id;
+    View ingest;
+    for (std::size_t field_index = 0; field_index < 7; ++field_index) {
+        const auto comma = row.find(',');
+        if ((comma == View::npos) != (field_index == 6)) {
+            return std::nullopt;
+        }
+        View field = row.substr(0, comma);
+        if (!field.empty() && field.front() == '"') {
+            if (field.size() < 2 || field.back() != '"') {
+                return std::nullopt;
+            }
+            field.remove_prefix(1);
+            field.remove_suffix(1);
+        }
+        if (field.find('"') != View::npos) return std::nullopt;
+        if (field_index == 0) id = field;
+        if (field_index == 3) ingest = field;
+        if (comma != View::npos) row.remove_prefix(comma + 1);
+    }
+    return std::pair{id, ingest};
+}
+
 std::vector<FingerprintedWinner> choose_winners_fingerprinted(
     const std::vector<View>& input) {
     if (input.size() >= std::numeric_limits<Key>::max()) {
@@ -473,12 +501,25 @@ std::vector<FingerprintedWinner> choose_winners_fingerprinted(
     std::vector<Key> buckets(bucket_count, 0);
     std::vector<FingerprintedWinner> winners;
     winners.reserve(input.size());
+    const auto* selector = std::getenv("SESSION_SELECTIVE_DEDUP_FIELDS");
+    const bool selective = selector && View(selector) == "1";
     for (const auto row : input) {
-        const auto fields = parse_csv<7>(row);
-        if (!fields || (*fields)[0].empty()) continue;
-        const auto ingest = timestamp((*fields)[3]);
+        View id;
+        View ingest_text;
+        if (selective) {
+            const auto parsed = dedup_id_ingest(row);
+            if (!parsed) continue;
+            id = parsed->first;
+            ingest_text = parsed->second;
+        } else {
+            const auto fields = parse_csv<7>(row);
+            if (!fields) continue;
+            id = (*fields)[0];
+            ingest_text = (*fields)[3];
+        }
+        if (id.empty()) continue;
+        const auto ingest = timestamp(ingest_text);
         if (!ingest) continue;
-        const View id = (*fields)[0];
         const auto hash = std::hash<View>{}(id);
         auto slot = hash & (bucket_count - 1);
         while (buckets[slot] &&
