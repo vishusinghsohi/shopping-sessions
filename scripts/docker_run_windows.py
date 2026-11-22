@@ -67,7 +67,7 @@ def main():
             "--memory-swap",
             memory,
             "--user",
-            "1000:1000",
+            os.getenv("TEST_DOCKER_USER", "1000:1000"),
             "--mount",
             f"type=bind,source={data},target=/data,readonly",
             "--mount",
