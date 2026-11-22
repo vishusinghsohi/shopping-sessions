@@ -56,15 +56,20 @@ def main():
         for mode, dest in ((False, baseline), (True, parallel)):
             dest.mkdir()
             env = dict(os.environ)
-            env.pop("SESSION_PARALLEL_SORT", None)
+            for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT"):
+                env.pop(toggle, None)
             if mode:
-                env["SESSION_PARALLEL_SORT"] = "1"
+                if os.environ.get("SORT_TEST_MODE") == "route_export":
+                    env["SESSION_PARALLEL_ROUTING"] = "1"
+                    env["SESSION_CSV_SAFETY_HINT"] = "1"
+                else:
+                    env["SESSION_PARALLEL_SORT"] = "1"
             print("Running", "parallel" if mode else "baseline", flush=True)
             subprocess.run([sys.executable, str(RUNNER), str(data), str(dest)],
                            check=True, env=env)
         subprocess.run([sys.executable, str(COMPARE), str(baseline), str(parallel)],
                        check=True)
-        print(f"PASS: {COUNT:,}-event baseline and parallel-sort Parquet outputs match", flush=True)
+        print(f"PASS: {COUNT:,}-event baseline and {os.getenv('SORT_TEST_MODE', 'parallel-sort')} Parquet outputs match", flush=True)
 
 
 if __name__ == "__main__":
