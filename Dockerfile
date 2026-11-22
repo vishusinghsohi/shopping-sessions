@@ -74,4 +74,9 @@ ENV SESSION_MMAP=1
 FROM cpp_mmap AS cpp_parallel_sort
 ENV SESSION_PARALLEL_SORT=1
 
+# Opt-in architecture experiment for parallel routing and report safety hints.
+FROM cpp_mmap AS cpp_route_export
+ENV SESSION_PARALLEL_ROUTING=1
+ENV SESSION_CSV_SAFETY_HINT=1
+
 FROM cpp_mmap AS competition
