@@ -1,6 +1,7 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <charconv>
@@ -11,6 +12,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -453,6 +455,48 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
     return winners;
 }
 
+// Keep a 64-bit hash fingerprint instead of an additional string_view per
+// winner. A matching fingerprint is always confirmed by exact event-ID
+// comparison, so hash collisions cannot change winner selection.
+struct FingerprintedWinner {
+    Winner record;
+    std::size_t fingerprint;
+};
+static_assert(sizeof(FingerprintedWinner) < sizeof(IndexedWinner));
+
+std::vector<FingerprintedWinner> choose_winners_fingerprinted(
+    const std::vector<View>& input) {
+    if (input.size() >= std::numeric_limits<Key>::max()) {
+        throw std::overflow_error("event shard index overflow");
+    }
+    const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
+    std::vector<Key> buckets(bucket_count, 0);
+    std::vector<FingerprintedWinner> winners;
+    winners.reserve(input.size());
+    for (const auto row : input) {
+        const auto fields = parse_csv<7>(row);
+        if (!fields || (*fields)[0].empty()) continue;
+        const auto ingest = timestamp((*fields)[3]);
+        if (!ingest) continue;
+        const View id = (*fields)[0];
+        const auto hash = std::hash<View>{}(id);
+        auto slot = hash & (bucket_count - 1);
+        while (buckets[slot] &&
+               (winners[buckets[slot] - 1].fingerprint != hash ||
+                routing_id(winners[buckets[slot] - 1].record.line) != id)) {
+            slot = (slot + 1) & (bucket_count - 1);
+        }
+        if (!buckets[slot]) {
+            winners.push_back({{row, *ingest}, hash});
+            buckets[slot] = static_cast<Key>(winners.size());
+        } else {
+            auto& current = winners[buckets[slot] - 1].record;
+            if (*ingest < current.ingest) current = {row, *ingest};
+        }
+    }
+    return winners;
+}
+
 struct EventShard {
     std::vector<View> users;
     std::vector<Event> events;
@@ -460,27 +504,215 @@ struct EventShard {
     double validate_seconds = 0;
 };
 
-EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
+EventShard load_shard(std::vector<View> rows, Window window,
+                      const Catalog& products, Key unknown) {
     EventShard shard;
     auto start = Clock::now();
-    const auto winners = choose_winners(rows);
-    std::vector<View>().swap(rows);
-    shard.dedup_seconds = seconds(start);
+    const auto* mode = std::getenv("SESSION_FINGERPRINTED_WINNERS");
+    const bool fingerprinted = mode && View(mode) == "1";
 
-    start = Clock::now();
-    std::unordered_map<View, Key> users;
-    shard.events.reserve(winners.size());
-    for (const auto& winner : winners) {
-        if (const auto valid = validate_event(winner.record, window, products, unknown)) {
-            const auto [key, inserted] = users.try_emplace(valid->user, static_cast<Key>(shard.users.size()));
-            if (inserted) {
-                shard.users.push_back(valid->user);
+    const auto validate_winners = [&](const auto& winners) {
+        std::unordered_map<View, Key> users;
+        shard.events.reserve(winners.size());
+        for (const auto& entry : winners) {
+            if (const auto valid = validate_event(entry.record, window, products, unknown)) {
+                const auto [it, inserted] = users.try_emplace(
+                    valid->user, static_cast<Key>(shard.users.size()));
+                if (inserted) shard.users.push_back(valid->user);
+                shard.events.push_back({
+                    valid->time, valid->revenue, it->second, valid->category});
             }
-            shard.events.push_back({valid->time, valid->revenue, key->second, valid->category});
         }
+    };
+    if (fingerprinted) {
+        const auto winners = choose_winners_fingerprinted(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
+    } else {
+        const auto winners = choose_winners(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
     }
     shard.validate_seconds = seconds(start);
     return shard;
+}
+
+// Opt-in parallel routing. Split each source partition on LF boundaries, so
+// every physical row is visited exactly once. Per-task outputs avoid locks in
+// the hot loop. Merge tasks in file order to preserve input row ordering.
+std::vector<std::vector<View>> route_events_parallel(
+    const std::vector<Partition>& storage, std::size_t workers) {
+    struct RoutingTask {
+        View chunk;
+        std::vector<std::vector<View>> routed;
+    };
+    std::vector<RoutingTask> tasks;
+    for (const auto& file : storage) {
+        const View full = file.view();
+        const auto header = full.find('\n');
+        if (header == View::npos) continue;
+        View body = full.substr(header + 1);
+        if (body.empty()) continue;
+        const std::size_t target =
+            std::max<std::size_t>(1, body.size() / (workers * 2));
+        std::size_t begin = 0;
+        while (begin < body.size()) {
+            std::size_t end = std::min(body.size(), begin + target);
+            if (end < body.size()) {
+                const auto newline = body.find('\n', end);
+                end = newline == View::npos ? body.size() : newline + 1;
+            }
+            tasks.push_back({body.substr(begin, end - begin), {}});
+            begin = end;
+        }
+    }
+
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> failures(workers);
+    const auto scan = [&](std::size_t worker) {
+        try {
+            while (true) {
+                const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= tasks.size()) break;
+                auto& task = tasks[index];
+                task.routed.resize(workers);
+                View body = task.chunk;
+                while (!body.empty()) {
+                    const auto newline = body.find('\n');
+                    const View line = newline == View::npos ? body : body.substr(0, newline);
+                    task.routed[std::hash<View>{}(routing_id(line)) % workers].push_back(line);
+                    if (newline == View::npos) break;
+                    body.remove_prefix(newline + 1);
+                }
+            }
+        } catch (...) {
+            failures[worker] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 1; i < workers; ++i) {
+            threads.emplace_back(scan, i);
+        }
+        scan(0);
+    }
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    std::vector<std::vector<View>> routed(workers);
+    std::vector<std::size_t> counts(workers, 0);
+    for (const auto& task : tasks) {
+        for (std::size_t i = 0; i < workers; ++i) {
+            counts[i] += task.routed[i].size();
+        }
+    }
+    for (std::size_t i = 0; i < workers; ++i) {
+        routed[i].reserve(counts[i]);
+    }
+    for (auto& task : tasks) {
+        for (std::size_t i = 0; i < workers; ++i) {
+            auto& rows = task.routed[i];
+            routed[i].insert(routed[i].end(), rows.begin(), rows.end());
+            std::vector<View>().swap(rows);
+        }
+    }
+    return routed;
+}
+
+// Two-pass, lock-free direct routing. The first parallel pass counts rows per
+// (chunk, shard); prefix offsets then give each chunk an exclusive contiguous
+// output region. The second pass fills those regions without intermediate
+// task-local row vectors or locks, preserving physical file/row order.
+std::vector<std::vector<View>> route_events_direct(
+    const std::vector<Partition>& storage, std::size_t workers) {
+    struct Task {
+        View body;
+        std::vector<std::size_t> counts;
+        std::vector<std::size_t> offsets;
+    };
+    std::vector<Task> tasks;
+    for (const auto& file : storage) {
+        const View full = file.view();
+        const auto header = full.find('\n');
+        if (header == View::npos) continue;
+        const View body = full.substr(header + 1);
+        if (body.empty()) continue;
+        const std::size_t target = std::max<std::size_t>(1, body.size() / (workers * 2));
+        std::size_t begin = 0;
+        while (begin < body.size()) {
+            std::size_t end = std::min(body.size(), begin + target);
+            if (end < body.size()) {
+                const auto newline = body.find('\n', end);
+                end = newline == View::npos ? body.size() : newline + 1;
+            }
+            tasks.push_back({body.substr(begin, end - begin),
+                             std::vector<std::size_t>(workers, 0),
+                             std::vector<std::size_t>(workers, 0)});
+            begin = end;
+        }
+    }
+    const auto execute = [&](bool fill, std::vector<std::vector<View>>* routed) {
+        std::atomic<std::size_t> next{0};
+        std::vector<std::exception_ptr> failures(workers);
+        const auto work = [&](std::size_t worker) {
+            try {
+                while (true) {
+                    const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= tasks.size()) break;
+                    auto& task = tasks[index];
+                    auto positions = task.offsets;
+                    View data = task.body;
+                    while (!data.empty()) {
+                        const auto newline = data.find('\n');
+                        const View line = newline == View::npos ? data : data.substr(0, newline);
+                        data = newline == View::npos ? View{} : data.substr(newline + 1);
+                        const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                        if (fill) {
+                            (*routed)[shard][positions[shard]++] = line;
+                        } else {
+                            ++task.counts[shard];
+                        }
+                    }
+                }
+            } catch (...) {
+                failures[worker] = std::current_exception();
+            }
+        };
+        {
+            std::vector<std::jthread> threads;
+            threads.reserve(workers - 1);
+            for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(work, i);
+            work(0);
+        }
+        for (const auto& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+    };
+    const auto count_start = Clock::now();
+    execute(false, nullptr);
+    profile("direct_route_count_seconds", count_start);
+
+    const auto allocate_start = Clock::now();
+    std::vector<std::vector<View>> routed(workers);
+    for (std::size_t shard = 0; shard < workers; ++shard) {
+        std::size_t total = 0;
+        for (auto& task : tasks) {
+            task.offsets[shard] = total;
+            total += task.counts[shard];
+        }
+        routed[shard].resize(total);
+    }
+    profile("direct_route_allocate_seconds", allocate_start);
+
+    const auto fill_start = Clock::now();
+    execute(true, &routed);
+    profile("direct_route_fill_seconds", fill_start);
+    return routed;
 }
 
 std::vector<Event> load_events(Input& input, const Path& data, Window window, Identities& ids,
@@ -498,12 +730,21 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
-    std::vector<std::vector<View>> routed(workers);
-    for (const auto& file : storage) {
-        rows(file.view(), [&](View line) {
-            const auto shard = std::hash<View>{}(routing_id(line)) % workers;
-            routed[shard].push_back(line);
-        });
+    std::vector<std::vector<View>> routed;
+    if (const auto* mode = std::getenv("SESSION_DIRECT_ROUTING");
+        mode && View(mode) == "1" && workers > 1) {
+        routed = route_events_direct(storage, workers);
+    } else if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
+        setting && View(setting) == "1" && workers > 1) {
+        routed = route_events_parallel(storage, workers);
+    } else {
+        routed.resize(workers);
+        for (const auto& file : storage) {
+            rows(file.view(), [&](View line) {
+                const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                routed[shard].push_back(line);
+            });
+        }
     }
     profile("event_route_seconds", start);
 
@@ -606,6 +847,66 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
     profile("click_parse_dedup_validate_seconds", start);
 }
 
+// Sort by (canonical numeric user, timestamp) without mixing user groups.
+// Range partitioning preserves global order when shards are concatenated.
+// Keep the old single-thread sort as the default until paired benchmarks show
+// that parallel partitioning beats its extra memory traffic.
+void sort_events(std::vector<Event>& events) {
+    const auto compare = [](const Event& a, const Event& b) {
+        return std::pair{a.user, a.time} < std::pair{b.user, b.time};
+    };
+    const char* configured = std::getenv("SESSION_PARALLEL_SORT");
+    const auto workers = worker_budget();
+    if (!configured || View(configured) != "1" || workers < 2 || events.size() < 100'000) {
+        std::ranges::sort(events, compare);
+        return;
+    }
+
+    const auto partition_start = Clock::now();
+    Key max_user = 0;
+    for (const auto& event : events) {
+        max_user = std::max(max_user, event.user);
+    }
+    // Use 64-bit arithmetic so max_user == UINT32_MAX is safe.
+    const auto range = static_cast<std::uint64_t>(max_user) + 1;
+    const auto shard_of = [&](Key user) -> std::size_t {
+        return static_cast<std::size_t>((static_cast<std::uint64_t>(user) * workers) / range);
+    };
+    std::vector<std::size_t> counts(workers, 0);
+    for (const auto& event : events) {
+        ++counts[shard_of(event.user)];
+    }
+    std::vector<std::vector<Event>> shards(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
+        shards[i].reserve(counts[i]);
+    }
+    for (const auto& event : events) {
+        shards[shard_of(event.user)].push_back(event);
+    }
+    std::vector<Event>().swap(events);
+    profile("parallel_sort_partition_seconds", partition_start);
+
+    const auto sorting_start = Clock::now();
+    std::vector<std::jthread> threads;
+    threads.reserve(workers - 1);
+    for (std::size_t i = 1; i < workers; ++i) {
+        threads.emplace_back([&, i] { std::ranges::sort(shards[i], compare); });
+    }
+    std::ranges::sort(shards[0], compare);
+    // All shards must finish sorting before we concatenate them.
+    threads.clear();
+    profile("parallel_sort_workers_seconds", sorting_start);
+
+    const auto merge_start = Clock::now();
+    std::size_t total = 0;
+    for (const auto& shard : shards) total += shard.size();
+    events.reserve(total);
+    for (const auto& shard : shards) {
+        events.insert(events.end(), shard.begin(), shard.end());
+    }
+    profile("parallel_sort_merge_seconds", merge_start);
+}
+
 struct Session {
     std::size_t first;
     std::size_t end;
@@ -689,7 +990,11 @@ using CampaignDaily = std::vector<std::unordered_map<Integer, CampaignTotals>>;
 CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Session>& sessions,
                         const std::vector<Click>& clicks, Key organic, std::size_t campaigns) {
     CampaignDaily daily(campaigns);
-    std::unordered_map<Key, std::size_t> active;
+    // Campaign keys are dense integer IDs. An indexed active set avoids
+    // repeated hash lookups and node allocations in the sliding window.
+    std::vector<std::size_t> active_counts(campaigns, 0);
+    std::vector<std::size_t> active_positions(campaigns, 0);
+    std::vector<Key> active_campaigns;
     std::size_t left = 0;
     std::size_t right = 0;
     std::optional<Key> previous;
@@ -702,19 +1007,30 @@ CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Sess
                 ++right;
             }
             left = right;
-            active.clear();
+            for (const Key campaign : active_campaigns) {
+                active_counts[campaign] = 0;
+            }
+            active_campaigns.clear();
             previous = user;
         }
         while (right < clicks.size() && clicks[right].user == user && clicks[right].time <= first.time) {
-            ++active[clicks[right++].campaign];
-        }
-        while (left < right && gap_exceeds(first.time, clicks[left].time, attribution_ms)) {
-            const auto entry = active.find(clicks[left++].campaign);
-            if (--entry->second == 0) {
-                active.erase(entry);
+            const Key campaign = clicks[right++].campaign;
+            if (active_counts[campaign]++ == 0) {
+                active_positions[campaign] = active_campaigns.size();
+                active_campaigns.push_back(campaign);
             }
         }
-        for (const auto& [campaign, count] : active) {
+        while (left < right && gap_exceeds(first.time, clicks[left].time, attribution_ms)) {
+            const Key campaign = clicks[left++].campaign;
+            if (--active_counts[campaign] == 0) {
+                const auto position = active_positions[campaign];
+                const Key last = active_campaigns.back();
+                active_campaigns[position] = last;
+                active_positions[last] = position;
+                active_campaigns.pop_back();
+            }
+        }
+        for (const Key campaign : active_campaigns) {
             add(daily[campaign][day].assisted_sessions, 1);
         }
         Key credited = organic;
@@ -730,6 +1046,108 @@ CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Sess
         add(row.revenue, session.revenue);
     }
     return daily;
+}
+
+// Opt-in canonical-user partitions. Global event-ID and click-ID deduplication
+// have already happened before this function. Each canonical user is assigned
+// to exactly one worker; session boundaries and attribution cannot cross it.
+struct UserPartition {
+    std::vector<Event> events;
+    std::vector<Click> clicks;
+};
+struct PartitionResult {
+    std::vector<UserRow> users;
+    CampaignDaily campaigns;
+    Integer sessions = 0;
+};
+struct ParallelUserResult {
+    std::vector<UserRow> users;
+    CampaignDaily campaigns;
+    Integer sessions = 0;
+};
+
+ParallelUserResult process_user_partitions(
+    std::vector<Event> events, std::vector<Click> clicks,
+    const Names& categories, Key organic, std::size_t campaign_count) {
+    const std::size_t workers = worker_budget();
+    const auto route_start = Clock::now();
+    std::vector<UserPartition> partitions(workers);
+    std::vector<std::size_t> event_counts(workers, 0), click_counts(workers, 0);
+    const auto shard_for = [workers](Key canonical) {
+        // This maps the same canonical user to the same worker for both tables.
+        return static_cast<std::size_t>(canonical) % workers;
+    };
+    for (const auto& event : events) ++event_counts[shard_for(event.user)];
+    for (const auto& click : clicks) ++click_counts[shard_for(click.user)];
+    for (std::size_t i = 0; i < workers; ++i) {
+        partitions[i].events.reserve(event_counts[i]);
+        partitions[i].clicks.reserve(click_counts[i]);
+    }
+    for (const auto& event : events) partitions[shard_for(event.user)].events.push_back(event);
+    for (const auto& click : clicks) partitions[shard_for(click.user)].clicks.push_back(click);
+    // Free the original, unpartitioned collections before sorting.
+    std::vector<Event>().swap(events);
+    std::vector<Click>().swap(clicks);
+    profile("canonical_partition_route_seconds", route_start);
+
+    const auto workers_start = Clock::now();
+    std::vector<PartitionResult> results(workers);
+    std::vector<std::exception_ptr> failures(workers);
+    const auto process = [&](std::size_t index) {
+        try {
+            auto& part = partitions[index];
+            std::ranges::sort(part.events, {}, [](const Event& event) {
+                return std::pair{event.user, event.time};
+            });
+            std::ranges::sort(part.clicks, {}, [](const Click& click) {
+                return std::tuple{click.user, click.time, click.id};
+            });
+            const auto sessions = sessions_for(part.events);
+            auto& result = results[index];
+            result.sessions = static_cast<Integer>(sessions.size());
+            result.users = aggregate_users(part.events, sessions, categories);
+            result.campaigns = attribute(
+                part.events, sessions, part.clicks, organic, campaign_count);
+        } catch (...) {
+            failures[index] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(workers - 1);
+        for (std::size_t i = 1; i < workers; ++i) {
+            threads.emplace_back(process, i);
+        }
+        process(0);
+    }
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+    profile("canonical_partition_workers_seconds", workers_start);
+
+    const auto merge_start = Clock::now();
+    ParallelUserResult combined;
+    combined.campaigns.resize(campaign_count);
+    std::size_t total_users = 0;
+    for (const auto& result : results) total_users += result.users.size();
+    combined.users.reserve(total_users);
+    for (auto& result : results) {
+        add(combined.sessions, result.sessions);
+        combined.users.insert(combined.users.end(),
+            std::make_move_iterator(result.users.begin()),
+            std::make_move_iterator(result.users.end()));
+        for (std::size_t campaign = 0; campaign < campaign_count; ++campaign) {
+            for (const auto& [day, subtotal] : result.campaigns[campaign]) {
+                auto& total = combined.campaigns[campaign][day];
+                add(total.sessions, subtotal.sessions);
+                add(total.purchasing_sessions, subtotal.purchasing_sessions);
+                add(total.revenue, subtotal.revenue);
+                add(total.assisted_sessions, subtotal.assisted_sessions);
+            }
+        }
+    }
+    profile("canonical_partition_merge_seconds", merge_start);
+    return combined;
 }
 
 std::string date_text(Integer day) {
@@ -771,6 +1189,14 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
     std::filesystem::create_directories(output);
     ReportFile user(output / "user_daily.csv");
     user.stream << "user_id,day,sessions,events,revenue_cents,top_category\n";
+    // The C++ report writer already sees each emitted string field.
+    // Record whether DuckDB's quote-disabled fast CSV path is safe, avoiding
+    // a second full file scan in Python when explicitly enabled.
+    const auto safe_text = [](View value) {
+        return value.find_first_of("\r\"") == View::npos;
+    };
+    bool user_csv_safe = true;
+    bool campaign_csv_safe = true;
     Integer user_sessions = 0;
     Integer user_events = 0;
     Integer user_revenue = 0;
@@ -778,6 +1204,8 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         add(user_sessions, row.sessions);
         add(user_events, row.events);
         add(user_revenue, row.revenue);
+        user_csv_safe = user_csv_safe && safe_text(identities.name(row.user)) &&
+            (!row.highest_category || safe_text(categories.name(*row.highest_category)));
         user.stream << identities.name(row.user) << ',' << date_text(row.day) << ',' << row.sessions
                     << ',' << row.events << ',' << row.revenue << ',';
         if (row.highest_category) {
@@ -795,12 +1223,28 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         for (const auto& [day, row] : daily[id]) {
             add(campaign_sessions, row.sessions);
             add(campaign_revenue, row.revenue);
+            campaign_csv_safe = campaign_csv_safe && safe_text(campaigns.ids.name(id)) &&
+                safe_text(campaigns.label(id));
             campaign.stream << campaigns.ids.name(id) << ',' << campaigns.label(id) << ','
                             << date_text(day) << ',' << row.sessions << ',' << row.purchasing_sessions
                             << ',' << row.revenue << ',' << row.assisted_sessions << '\n';
         }
     }
     campaign.finish();
+    if (const auto* flag = std::getenv("SESSION_CSV_SAFETY_HINT");
+        flag && View(flag) == "1") {
+        // Written only after the corresponding CSV files are closed.
+        // Python always falls back to its legacy scanner if hints are absent.
+        std::ofstream user_hint(output / "user_daily.safe", std::ios::binary);
+        std::ofstream campaign_hint(output / "campaign_daily.safe", std::ios::binary);
+        user_hint << (user_csv_safe ? "safe\n" : "unsafe\n");
+        campaign_hint << (campaign_csv_safe ? "safe\n" : "unsafe\n");
+        user_hint.close();
+        campaign_hint.close();
+        if (!user_hint || !campaign_hint) {
+            throw std::runtime_error("failed to write report safety hints");
+        }
+    }
     if (user_sessions != session_count || campaign_sessions != session_count ||
         user_events != event_count || user_revenue != campaign_revenue) {
         throw std::runtime_error("report reconciliation failed");
@@ -922,35 +1366,63 @@ void run(const Path& data, const Path& reports) {
     load_catalog(input, data / "products.csv", products);
     const Key unknown = products.labels.intern("unknown");
     auto events = load_events(input, data, window, identities, products, unknown);
-    start = Clock::now();
-    std::ranges::sort(events, {}, [](const Event& event) { return std::pair{event.user, event.time}; });
-    profile("event_sort_seconds", start);
+    const auto* partition_flag = std::getenv("SESSION_CANONICAL_PARTITIONS");
+    if (partition_flag && View(partition_flag) == "1" && worker_budget() > 1) {
+        // Global event deduplication and canonical identity resolution are
+        // complete; click deduplication also finishes before partitioning.
+        Catalog campaigns;
+        load_catalog(input, data / "campaigns.csv", campaigns);
+        Clicks clicks;
+        load_clicks(input, data, window, identities, campaigns, clicks);
+        const Key organic = campaigns.insert("organic", "organic");
+        const Integer event_count = static_cast<Integer>(events.size());
 
-    start = Clock::now();
-    const auto sessions = sessions_for(events);
-    profile("sessionize_seconds", start);
-    start = Clock::now();
-    const auto user_rows = aggregate_users(events, sessions, products.labels);
-    profile("user_aggregate_seconds", start);
+        start = Clock::now();
+        auto grouped = process_user_partitions(
+            std::move(events), std::move(clicks.records),
+            products.labels, organic, campaigns.ids.size());
+        profile("canonical_partition_total_seconds", start);
 
-    Catalog campaigns;
-    load_catalog(input, data / "campaigns.csv", campaigns);
-    Clicks clicks;
-    load_clicks(input, data, window, identities, campaigns, clicks);
-    const Key organic = campaigns.insert("organic", "organic");
-    start = Clock::now();
-    std::ranges::sort(clicks.records, {}, [](const Click& click) {
-        return std::tuple{click.user, click.time, click.id};
-    });
-    profile("click_sort_seconds", start);
+        start = Clock::now();
+        write_reports(reports, grouped.users, identities, products.labels,
+                      grouped.campaigns, campaigns, event_count, grouped.sessions);
+        profile("csv_export_seconds", start);
+    } else {
+        // Preserve the verified serial post-deduplication pipeline as the
+        // production default for exact A/B comparisons.
+        start = Clock::now();
+        sort_events(events);
+        profile("event_sort_seconds", start);
 
-    start = Clock::now();
-    const auto campaign_rows = attribute(events, sessions, clicks.records, organic, campaigns.ids.size());
-    profile("attribute_seconds", start);
-    start = Clock::now();
-    write_reports(reports, user_rows, identities, products.labels, campaign_rows, campaigns,
-                  static_cast<Integer>(events.size()), static_cast<Integer>(sessions.size()));
-    profile("csv_export_seconds", start);
+        start = Clock::now();
+        const auto sessions = sessions_for(events);
+        profile("sessionize_seconds", start);
+        start = Clock::now();
+        const auto user_rows = aggregate_users(events, sessions, products.labels);
+        profile("user_aggregate_seconds", start);
+
+        Catalog campaigns;
+        load_catalog(input, data / "campaigns.csv", campaigns);
+        Clicks clicks;
+        load_clicks(input, data, window, identities, campaigns, clicks);
+        const Key organic = campaigns.insert("organic", "organic");
+        start = Clock::now();
+        std::ranges::sort(clicks.records, {}, [](const Click& click) {
+            return std::tuple{click.user, click.time, click.id};
+        });
+        profile("click_sort_seconds", start);
+
+        start = Clock::now();
+        const auto campaign_rows = attribute(
+            events, sessions, clicks.records, organic, campaigns.ids.size());
+        profile("attribute_seconds", start);
+        start = Clock::now();
+        write_reports(reports, user_rows, identities, products.labels,
+                      campaign_rows, campaigns,
+                      static_cast<Integer>(events.size()),
+                      static_cast<Integer>(sessions.size()));
+        profile("csv_export_seconds", start);
+    }
     std::cout << "[INNER] input_read_seconds " << input.read_seconds << '\n';
     if (input.map_partitions) {
         std::cout << "[INNER] input_map_seconds " << input.map_seconds << '\n';

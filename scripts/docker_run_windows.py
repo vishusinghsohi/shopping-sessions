@@ -21,6 +21,10 @@ def main():
         parents=True,
         exist_ok=True,
     )
+    # Fixture harness output directories may be mode 0700 on Linux.
+    # Container runs as UID 1000, which must be able to write here.
+    if os.name == "posix":
+        output.chmod(0o777)
 
     if not data.is_dir():
         raise SystemExit(
@@ -31,6 +35,8 @@ def main():
         prefix="shopping-scratch-"
     ) as temp:
         scratch = Path(temp).resolve()
+        if os.name == "posix":
+            scratch.chmod(0o777)
 
         cpus = os.getenv("CPUS", "8")
         memory = os.getenv("MEM", "24g")
@@ -61,7 +67,7 @@ def main():
             "--memory-swap",
             memory,
             "--user",
-            "1000:1000",
+            os.getenv("TEST_DOCKER_USER", "1000:1000"),
             "--mount",
             f"type=bind,source={data},target=/data,readonly",
             "--mount",
@@ -82,6 +88,11 @@ def main():
             f"MEM_GB={memory.rstrip('gG')}",
             image,
         ]
+
+        # Optional experimental sorting architecture; defaults to the baseline.
+        for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS"):
+            if os.getenv(toggle) == "1":
+                command[-1:-1] = ["-e", f"{toggle}=1"]
 
         return subprocess.run(
             command,

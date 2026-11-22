@@ -70,4 +70,33 @@ ENV SESSION_ENGINE=/app/cpp_engine
 FROM cpp AS cpp_mmap
 ENV SESSION_MMAP=1
 
+# Explicit opt-in experiment: compare against the mmap baseline with the same binary.
+FROM cpp_mmap AS cpp_parallel_sort
+ENV SESSION_PARALLEL_SORT=1
+
+# Opt-in architecture experiment for parallel routing and report safety hints.
+FROM cpp_mmap AS cpp_route_export
+ENV SESSION_PARALLEL_ROUTING=1
+ENV SESSION_CSV_SAFETY_HINT=1
+
+# Opt-in complete canonical-user parallel processing architecture.
+FROM cpp_mmap AS cpp_canonical_users
+ENV SESSION_CANONICAL_PARTITIONS=1
+
+# Experimental lock-free direct parallel router plus canonical-user processing.
+FROM cpp_mmap AS cpp_direct_canonical
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+
+# Opt-in hash fingerprint compact-winner dedup + direct canonical routing.
+FROM cpp_mmap AS cpp_direct_fingerprint
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+ENV SESSION_FINGERPRINTED_WINNERS=1
+
+# Competition submission uses the verified optimized C++ path.
+# Defaults remain overrideable through Docker environment at runtime.
 FROM cpp_mmap AS competition
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+ENV SESSION_FINGERPRINTED_WINNERS=1

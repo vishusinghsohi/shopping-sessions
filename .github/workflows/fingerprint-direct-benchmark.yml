@@ -1,0 +1,45 @@
+name: Dedup winner fingerprint A/B
+
+on:
+  push:
+    branches:
+      - perf/direct-fingerprint-dedup
+
+jobs:
+  fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build C++ mmap engine and CTest
+        run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Install comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Verify all 36 official fixtures with direct routing, canonical users and fingerprinted dedup
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_DIRECT_ROUTING: '1'
+          SESSION_CANONICAL_PARTITIONS: '1'
+          SESSION_FINGERPRINTED_WINNERS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Compare 2M-event fingerprinted and baseline dedup
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: fingerprint_direct
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '3'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Compare 20M-event fingerprinted and baseline dedup
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_MODE: fingerprint_direct
+          SORT_TEST_EVENTS: '20000000'
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '2'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py

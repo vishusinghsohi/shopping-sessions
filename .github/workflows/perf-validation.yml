@@ -1,0 +1,75 @@
+name: Verify indexed campaign attribution
+
+on:
+  push:
+    branches:
+      - perf/indexed-campaign-window
+      - perf/parallel-event-sort
+      - perf/route-and-export-profile
+      - perf/canonical-user-partition
+  pull_request:
+    paths:
+      - 'cpp_engine/**'
+      - 'pipeline/**'
+      - 'Dockerfile'
+      - 'run.sh'
+      - '.github/workflows/perf-validation.yml'
+
+jobs:
+  cpp-and-fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build C++ mmap runtime (includes CTest during Docker build)
+        run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Build actual competition submission image
+        run: docker build --target competition -t shopping-sessions:competition .
+      - name: Install fixture comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Verify exact Parquet outputs on all fixtures
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_PARALLEL_ROUTING: '1'
+          SESSION_CSV_SAFETY_HINT: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Verify actual competition image without experimental environment flags
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          IMAGE: shopping-sessions:competition
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Compare 200k-event baseline versus parallel-sort output
+        env:
+          CPUS: '4'
+          MEM: '8g'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Compare 2M-event baseline versus parallel-sort output
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Compare 2M-event baseline versus route/export architecture
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: route_export
+          SORT_TEST_TRIALS: '3'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Verify canonical-user partition processing on official fixtures
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_CANONICAL_PARTITIONS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Benchmark 2M-event canonical-user parallel processing
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: canonical_users
+          SORT_TEST_TRIALS: '3'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
