@@ -75,7 +75,7 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS"):
                     env.pop(toggle, None)
                 mode = os.environ.get("SORT_TEST_MODE", "")
                 if mode in ("direct_canonical", "buffered_canonical"):
