@@ -689,7 +689,11 @@ using CampaignDaily = std::vector<std::unordered_map<Integer, CampaignTotals>>;
 CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Session>& sessions,
                         const std::vector<Click>& clicks, Key organic, std::size_t campaigns) {
     CampaignDaily daily(campaigns);
-    std::unordered_map<Key, std::size_t> active;
+    // Campaign keys are dense integer IDs. An indexed active set avoids
+    // repeated hash lookups and node allocations in the sliding window.
+    std::vector<std::size_t> active_counts(campaigns, 0);
+    std::vector<std::size_t> active_positions(campaigns, 0);
+    std::vector<Key> active_campaigns;
     std::size_t left = 0;
     std::size_t right = 0;
     std::optional<Key> previous;
@@ -702,19 +706,30 @@ CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Sess
                 ++right;
             }
             left = right;
-            active.clear();
+            for (const Key campaign : active_campaigns) {
+                active_counts[campaign] = 0;
+            }
+            active_campaigns.clear();
             previous = user;
         }
         while (right < clicks.size() && clicks[right].user == user && clicks[right].time <= first.time) {
-            ++active[clicks[right++].campaign];
-        }
-        while (left < right && gap_exceeds(first.time, clicks[left].time, attribution_ms)) {
-            const auto entry = active.find(clicks[left++].campaign);
-            if (--entry->second == 0) {
-                active.erase(entry);
+            const Key campaign = clicks[right++].campaign;
+            if (active_counts[campaign]++ == 0) {
+                active_positions[campaign] = active_campaigns.size();
+                active_campaigns.push_back(campaign);
             }
         }
-        for (const auto& [campaign, count] : active) {
+        while (left < right && gap_exceeds(first.time, clicks[left].time, attribution_ms)) {
+            const Key campaign = clicks[left++].campaign;
+            if (--active_counts[campaign] == 0) {
+                const auto position = active_positions[campaign];
+                const Key last = active_campaigns.back();
+                active_campaigns[position] = last;
+                active_positions[last] = position;
+                active_campaigns.pop_back();
+            }
+        }
+        for (const Key campaign : active_campaigns) {
             add(daily[campaign][day].assisted_sessions, 1);
         }
         Key credited = organic;
