@@ -568,6 +568,97 @@ std::vector<std::vector<View>> route_events_parallel(
     return routed;
 }
 
+// Two-pass, lock-free direct routing. The first parallel pass counts rows per
+// (chunk, shard); prefix offsets then give each chunk an exclusive contiguous
+// output region. The second pass fills those regions without intermediate
+// task-local row vectors or locks, preserving physical file/row order.
+std::vector<std::vector<View>> route_events_direct(
+    const std::vector<Partition>& storage, std::size_t workers) {
+    struct Task {
+        View body;
+        std::vector<std::size_t> counts;
+        std::vector<std::size_t> offsets;
+    };
+    std::vector<Task> tasks;
+    for (const auto& file : storage) {
+        const View full = file.view();
+        const auto header = full.find('\n');
+        if (header == View::npos) continue;
+        const View body = full.substr(header + 1);
+        if (body.empty()) continue;
+        const std::size_t target = std::max<std::size_t>(1, body.size() / (workers * 2));
+        std::size_t begin = 0;
+        while (begin < body.size()) {
+            std::size_t end = std::min(body.size(), begin + target);
+            if (end < body.size()) {
+                const auto newline = body.find('\n', end);
+                end = newline == View::npos ? body.size() : newline + 1;
+            }
+            tasks.push_back({body.substr(begin, end - begin),
+                             std::vector<std::size_t>(workers, 0),
+                             std::vector<std::size_t>(workers, 0)});
+            begin = end;
+        }
+    }
+    const auto execute = [&](bool fill, std::vector<std::vector<View>>* routed) {
+        std::atomic<std::size_t> next{0};
+        std::vector<std::exception_ptr> failures(workers);
+        const auto work = [&](std::size_t worker) {
+            try {
+                while (true) {
+                    const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= tasks.size()) break;
+                    auto& task = tasks[index];
+                    auto positions = task.offsets;
+                    View data = task.body;
+                    while (!data.empty()) {
+                        const auto newline = data.find('\n');
+                        const View line = newline == View::npos ? data : data.substr(0, newline);
+                        data = newline == View::npos ? View{} : data.substr(newline + 1);
+                        const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                        if (fill) {
+                            (*routed)[shard][positions[shard]++] = line;
+                        } else {
+                            ++task.counts[shard];
+                        }
+                    }
+                }
+            } catch (...) {
+                failures[worker] = std::current_exception();
+            }
+        };
+        {
+            std::vector<std::jthread> threads;
+            threads.reserve(workers - 1);
+            for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(work, i);
+            work(0);
+        }
+        for (const auto& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+    };
+    const auto count_start = Clock::now();
+    execute(false, nullptr);
+    profile("direct_route_count_seconds", count_start);
+
+    const auto allocate_start = Clock::now();
+    std::vector<std::vector<View>> routed(workers);
+    for (std::size_t shard = 0; shard < workers; ++shard) {
+        std::size_t total = 0;
+        for (auto& task : tasks) {
+            task.offsets[shard] = total;
+            total += task.counts[shard];
+        }
+        routed[shard].resize(total);
+    }
+    profile("direct_route_allocate_seconds", allocate_start);
+
+    const auto fill_start = Clock::now();
+    execute(true, &routed);
+    profile("direct_route_fill_seconds", fill_start);
+    return routed;
+}
+
 std::vector<Event> load_events(Input& input, const Path& data, Window window, Identities& ids,
                                const Catalog& products, Key unknown) {
     const auto files = partitions(data / "events");
@@ -584,7 +675,10 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     start = Clock::now();
     const auto workers = worker_budget();
     std::vector<std::vector<View>> routed;
-    if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
+    if (const auto* mode = std::getenv("SESSION_DIRECT_ROUTING");
+        mode && View(mode) == "1" && workers > 1) {
+        routed = route_events_direct(storage, workers);
+    } else if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
         setting && View(setting) == "1" && workers > 1) {
         routed = route_events_parallel(storage, workers);
     } else {
