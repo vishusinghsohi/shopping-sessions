@@ -117,10 +117,10 @@ def inspect_report_with_engine_hint(csv_path, schema):
         return inspect_diagnostic_csv(csv_path, schema)
 
     hint = hint_file.read_bytes()
-    if hint not in (b"safe\\n", b"unsafe\\n"):
+    if hint not in (b"safe\n", b"unsafe\n"):
         return inspect_diagnostic_csv(csv_path, schema)
 
-    header = (",".join(name for name, _ in schema) + "\\n").encode("utf-8")
+    header = (",".join(name for name, _ in schema) + "\n").encode("utf-8")
     with csv_path.open("rb") as source:
         actual = source.readline()
     if actual != header:
@@ -128,7 +128,7 @@ def inspect_report_with_engine_hint(csv_path, schema):
 
     # The engine always writes a trailing newline after every output row.
     has_rows = csv_path.stat().st_size > len(header)
-    return has_rows, hint == b"safe\\n"
+    return has_rows, hint == b"safe\n"
 
 
 def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
