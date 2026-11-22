@@ -936,6 +936,14 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
     std::filesystem::create_directories(output);
     ReportFile user(output / "user_daily.csv");
     user.stream << "user_id,day,sessions,events,revenue_cents,top_category\n";
+    // The C++ report writer already sees each emitted string field.
+    // Record whether DuckDB's quote-disabled fast CSV path is safe, avoiding
+    // a second full file scan in Python when explicitly enabled.
+    const auto safe_text = [](View value) {
+        return value.find_first_of("\r\"") == View::npos;
+    };
+    bool user_csv_safe = true;
+    bool campaign_csv_safe = true;
     Integer user_sessions = 0;
     Integer user_events = 0;
     Integer user_revenue = 0;
@@ -943,6 +951,8 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         add(user_sessions, row.sessions);
         add(user_events, row.events);
         add(user_revenue, row.revenue);
+        user_csv_safe = user_csv_safe && safe_text(identities.name(row.user)) &&
+            (!row.highest_category || safe_text(categories.name(*row.highest_category)));
         user.stream << identities.name(row.user) << ',' << date_text(row.day) << ',' << row.sessions
                     << ',' << row.events << ',' << row.revenue << ',';
         if (row.highest_category) {
@@ -960,12 +970,28 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         for (const auto& [day, row] : daily[id]) {
             add(campaign_sessions, row.sessions);
             add(campaign_revenue, row.revenue);
+            campaign_csv_safe = campaign_csv_safe && safe_text(campaigns.ids.name(id)) &&
+                safe_text(campaigns.label(id));
             campaign.stream << campaigns.ids.name(id) << ',' << campaigns.label(id) << ','
                             << date_text(day) << ',' << row.sessions << ',' << row.purchasing_sessions
                             << ',' << row.revenue << ',' << row.assisted_sessions << '\n';
         }
     }
     campaign.finish();
+    if (const auto* flag = std::getenv("SESSION_CSV_SAFETY_HINT");
+        flag && View(flag) == "1") {
+        // Written only after the corresponding CSV files are closed.
+        // Python always falls back to its legacy scanner if hints are absent.
+        std::ofstream user_hint(output / "user_daily.safe", std::ios::binary);
+        std::ofstream campaign_hint(output / "campaign_daily.safe", std::ios::binary);
+        user_hint << (user_csv_safe ? "safe\n" : "unsafe\n");
+        campaign_hint << (campaign_csv_safe ? "safe\n" : "unsafe\n");
+        user_hint.close();
+        campaign_hint.close();
+        if (!user_hint || !campaign_hint) {
+            throw std::runtime_error("failed to write report safety hints");
+        }
+    }
     if (user_sessions != session_count || campaign_sessions != session_count ||
         user_events != event_count || user_revenue != campaign_revenue) {
         throw std::runtime_error("report reconciliation failed");
