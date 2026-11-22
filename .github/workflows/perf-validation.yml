@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build C++ mmap runtime (includes CTest during Docker build)
         run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Build actual competition submission image
+        run: docker build --target competition -t shopping-sessions:competition .
       - name: Install fixture comparison dependencies
         run: python3 -m pip install --user 'polars>=1.0,<2'
       - name: Verify exact Parquet outputs on all fixtures
@@ -31,6 +33,12 @@ jobs:
           MEM: '8g'
           SESSION_PARALLEL_ROUTING: '1'
           SESSION_CSV_SAFETY_HINT: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Verify actual competition image without experimental environment flags
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          IMAGE: shopping-sessions:competition
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
       - name: Compare 200k-event baseline versus parallel-sort output
         env:
