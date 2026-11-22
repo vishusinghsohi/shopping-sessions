@@ -70,6 +70,8 @@ def main():
                     if os.environ.get("SORT_TEST_MODE") == "route_export":
                         env["SESSION_PARALLEL_ROUTING"] = "1"
                         env["SESSION_CSV_SAFETY_HINT"] = "1"
+                    elif os.environ.get("SORT_TEST_MODE") == "hash_once":
+                        env["SESSION_HASH_ONCE"] = "1"
                     else:
                         env["SESSION_PARALLEL_SORT"] = "1"
                 started = time.perf_counter()
