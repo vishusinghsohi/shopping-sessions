@@ -1,5 +1,24 @@
 # Shopping Sessions
 
+## 60M-validated canonical identity merge (competition target)
+
+The `competition` Docker target now enables `SESSION_FUSED_CANONICAL_MERGE=1`
+alongside direct event routing, fingerprinted shard-local deduplication and
+canonical-user parallel processing. This routes valid events to canonical-user
+partitions during identity merging instead of allocating a redundant global
+event vector and copying it again.
+
+The change passed all 36 official fixtures and exact typed Parquet comparisons
+against the previous `main` build for 60 million synthetic rows with 10%
+duplicate event IDs. On three paired 4-vCPU Linux CI runs, the median
+full-pipeline time fell from 11.623 s to 10.901 s (~6.2%), with peak C++ RSS
+approximately 6 GiB for both. CI evidence:
+https://github.com/vishusinghsohi/shopping-sessions/actions/runs/44984673422
+
+**The synthetic CI test is not the official competition score.** The latest
+previous official submission recorded 19.8073 s. A new scored 8-vCPU/24-GB
+competition submission is needed to measure the effect on that workload.
+
 ## Competition submission (optimized C++ build)
 
 The default `competition` Docker target enables the three validated
