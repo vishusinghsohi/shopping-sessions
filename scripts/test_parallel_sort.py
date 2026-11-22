@@ -49,8 +49,19 @@ def main():
                 ts = base + ((i * 1237) % 1200) * 60_000
                 kind = "purchase" if i % 7 == 0 else "view"
                 price = "500" if kind == "purchase" else ""
+                duplicate_test = os.environ.get("SORT_TEST_DUPLICATES") == "1"
+                distinct = COUNT - max(1, COUNT // 10)
+                duplicate = duplicate_test and i >= distinct
+                event_id = i - distinct if duplicate else i
+                ingest = ts + 1000
+                if duplicate:
+                    # These far-apart duplicates stress global winner
+                    # reconciliation. Many late rows win by earlier ingest.
+                    ingest = base + (event_id % 2) * 1000
+                    if event_id % 11 == 0:
+                        kind = "invalid_event_kind"
                 out.write(
-                    f"e{i},u{(i * 43) % 2500:04d},{ts},{ts + 1000},"
+                    f"e{event_id},u{(i * 43) % 2500:04d},{ts},{ingest},"
                     f"{kind},{'p1' if i % 2 else 'p2'},{price}\n"
                 )
 
@@ -82,6 +93,12 @@ def main():
                 if match is None:
                     raise RuntimeError("Missing engine timing:\\n" + result.stdout[-2500:])
                 internal = float(match[1])
+                if os.environ.get("SORT_TEST_PROFILE") == "1":
+                    for line in result.stdout.splitlines():
+                        if (line.startswith("[INNER] ") or
+                            line.startswith("[PROFILE] C++ peak RSS:") or
+                            line.startswith("[PROFILE] C++ time:")):
+                            print(f"PROFILE {label} trial={trial} {line}", flush=True)
                 measurements[label].append(internal)
                 outputs[label] = dest
                 print(f"{label} trial={trial} pipeline={internal:.4f}s host={wall:.4f}s", flush=True)
