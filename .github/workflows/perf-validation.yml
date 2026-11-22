@@ -5,6 +5,7 @@ on:
     branches:
       - perf/indexed-campaign-window
       - perf/parallel-event-sort
+      - perf/route-and-export-profile
   pull_request:
     paths:
       - 'cpp_engine/**'
@@ -27,6 +28,8 @@ jobs:
         env:
           CPUS: '4'
           MEM: '8g'
+          SESSION_PARALLEL_ROUTING: '1'
+          SESSION_CSV_SAFETY_HINT: '1'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
       - name: Compare 200k-event baseline versus parallel-sort output
         env:
@@ -38,4 +41,12 @@ jobs:
           CPUS: '4'
           MEM: '8g'
           SORT_TEST_EVENTS: '2000000'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Compare 2M-event baseline versus route/export architecture
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: route_export
+          SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py

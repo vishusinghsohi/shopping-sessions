@@ -1,6 +1,7 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <charconv>
@@ -483,6 +484,89 @@ EventShard load_shard(std::vector<View> rows, Window window, const Catalog& prod
     return shard;
 }
 
+// Opt-in parallel routing. Split each source partition on LF boundaries, so
+// every physical row is visited exactly once. Per-task outputs avoid locks in
+// the hot loop. Merge tasks in file order to preserve input row ordering.
+std::vector<std::vector<View>> route_events_parallel(
+    const std::vector<Partition>& storage, std::size_t workers) {
+    struct RoutingTask {
+        View chunk;
+        std::vector<std::vector<View>> routed;
+    };
+    std::vector<RoutingTask> tasks;
+    for (const auto& file : storage) {
+        const View full = file.view();
+        const auto header = full.find('\n');
+        if (header == View::npos) continue;
+        View body = full.substr(header + 1);
+        if (body.empty()) continue;
+        const std::size_t target =
+            std::max<std::size_t>(1, body.size() / (workers * 2));
+        std::size_t begin = 0;
+        while (begin < body.size()) {
+            std::size_t end = std::min(body.size(), begin + target);
+            if (end < body.size()) {
+                const auto newline = body.find('\n', end);
+                end = newline == View::npos ? body.size() : newline + 1;
+            }
+            tasks.push_back({body.substr(begin, end - begin), {}});
+            begin = end;
+        }
+    }
+
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> failures(workers);
+    const auto scan = [&](std::size_t worker) {
+        try {
+            while (true) {
+                const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= tasks.size()) break;
+                auto& task = tasks[index];
+                task.routed.resize(workers);
+                View body = task.chunk;
+                while (!body.empty()) {
+                    const auto newline = body.find('\n');
+                    const View line = newline == View::npos ? body : body.substr(0, newline);
+                    task.routed[std::hash<View>{}(routing_id(line)) % workers].push_back(line);
+                    if (newline == View::npos) break;
+                    body.remove_prefix(newline + 1);
+                }
+            }
+        } catch (...) {
+            failures[worker] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 1; i < workers; ++i) {
+            threads.emplace_back(scan, i);
+        }
+        scan(0);
+    }
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    std::vector<std::vector<View>> routed(workers);
+    std::vector<std::size_t> counts(workers, 0);
+    for (const auto& task : tasks) {
+        for (std::size_t i = 0; i < workers; ++i) {
+            counts[i] += task.routed[i].size();
+        }
+    }
+    for (std::size_t i = 0; i < workers; ++i) {
+        routed[i].reserve(counts[i]);
+    }
+    for (auto& task : tasks) {
+        for (std::size_t i = 0; i < workers; ++i) {
+            auto& rows = task.routed[i];
+            routed[i].insert(routed[i].end(), rows.begin(), rows.end());
+            std::vector<View>().swap(rows);
+        }
+    }
+    return routed;
+}
+
 std::vector<Event> load_events(Input& input, const Path& data, Window window, Identities& ids,
                                const Catalog& products, Key unknown) {
     const auto files = partitions(data / "events");
@@ -498,12 +582,18 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
-    std::vector<std::vector<View>> routed(workers);
-    for (const auto& file : storage) {
-        rows(file.view(), [&](View line) {
-            const auto shard = std::hash<View>{}(routing_id(line)) % workers;
-            routed[shard].push_back(line);
-        });
+    std::vector<std::vector<View>> routed;
+    if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
+        setting && View(setting) == "1" && workers > 1) {
+        routed = route_events_parallel(storage, workers);
+    } else {
+        routed.resize(workers);
+        for (const auto& file : storage) {
+            rows(file.view(), [&](View line) {
+                const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                routed[shard].push_back(line);
+            });
+        }
     }
     profile("event_route_seconds", start);
 
@@ -846,6 +936,14 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
     std::filesystem::create_directories(output);
     ReportFile user(output / "user_daily.csv");
     user.stream << "user_id,day,sessions,events,revenue_cents,top_category\n";
+    // The C++ report writer already sees each emitted string field.
+    // Record whether DuckDB's quote-disabled fast CSV path is safe, avoiding
+    // a second full file scan in Python when explicitly enabled.
+    const auto safe_text = [](View value) {
+        return value.find_first_of("\r\"") == View::npos;
+    };
+    bool user_csv_safe = true;
+    bool campaign_csv_safe = true;
     Integer user_sessions = 0;
     Integer user_events = 0;
     Integer user_revenue = 0;
@@ -853,6 +951,8 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         add(user_sessions, row.sessions);
         add(user_events, row.events);
         add(user_revenue, row.revenue);
+        user_csv_safe = user_csv_safe && safe_text(identities.name(row.user)) &&
+            (!row.highest_category || safe_text(categories.name(*row.highest_category)));
         user.stream << identities.name(row.user) << ',' << date_text(row.day) << ',' << row.sessions
                     << ',' << row.events << ',' << row.revenue << ',';
         if (row.highest_category) {
@@ -870,12 +970,28 @@ void write_reports(const Path& output, const std::vector<UserRow>& users, const 
         for (const auto& [day, row] : daily[id]) {
             add(campaign_sessions, row.sessions);
             add(campaign_revenue, row.revenue);
+            campaign_csv_safe = campaign_csv_safe && safe_text(campaigns.ids.name(id)) &&
+                safe_text(campaigns.label(id));
             campaign.stream << campaigns.ids.name(id) << ',' << campaigns.label(id) << ','
                             << date_text(day) << ',' << row.sessions << ',' << row.purchasing_sessions
                             << ',' << row.revenue << ',' << row.assisted_sessions << '\n';
         }
     }
     campaign.finish();
+    if (const auto* flag = std::getenv("SESSION_CSV_SAFETY_HINT");
+        flag && View(flag) == "1") {
+        // Written only after the corresponding CSV files are closed.
+        // Python always falls back to its legacy scanner if hints are absent.
+        std::ofstream user_hint(output / "user_daily.safe", std::ios::binary);
+        std::ofstream campaign_hint(output / "campaign_daily.safe", std::ios::binary);
+        user_hint << (user_csv_safe ? "safe\n" : "unsafe\n");
+        campaign_hint << (campaign_csv_safe ? "safe\n" : "unsafe\n");
+        user_hint.close();
+        campaign_hint.close();
+        if (!user_hint || !campaign_hint) {
+            throw std::runtime_error("failed to write report safety hints");
+        }
+    }
     if (user_sessions != session_count || campaign_sessions != session_count ||
         user_events != event_count || user_revenue != campaign_revenue) {
         throw std::runtime_error("report reconciliation failed");

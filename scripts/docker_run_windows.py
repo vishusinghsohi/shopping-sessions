@@ -90,8 +90,9 @@ def main():
         ]
 
         # Optional experimental sorting architecture; defaults to the baseline.
-        if os.getenv("SESSION_PARALLEL_SORT") == "1":
-            command[-1:-1] = ["-e", "SESSION_PARALLEL_SORT=1"]
+        for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT"):
+            if os.getenv(toggle) == "1":
+                command[-1:-1] = ["-e", f"{toggle}=1"]
 
         return subprocess.run(
             command,
