@@ -12,6 +12,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -897,6 +898,108 @@ CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Sess
     return daily;
 }
 
+// Opt-in canonical-user partitions. Global event-ID and click-ID deduplication
+// have already happened before this function. Each canonical user is assigned
+// to exactly one worker; session boundaries and attribution cannot cross it.
+struct UserPartition {
+    std::vector<Event> events;
+    std::vector<Click> clicks;
+};
+struct PartitionResult {
+    std::vector<UserRow> users;
+    CampaignDaily campaigns;
+    Integer sessions = 0;
+};
+struct ParallelUserResult {
+    std::vector<UserRow> users;
+    CampaignDaily campaigns;
+    Integer sessions = 0;
+};
+
+ParallelUserResult process_user_partitions(
+    std::vector<Event> events, std::vector<Click> clicks,
+    const Names& categories, Key organic, std::size_t campaign_count) {
+    const std::size_t workers = worker_budget();
+    const auto route_start = Clock::now();
+    std::vector<UserPartition> partitions(workers);
+    std::vector<std::size_t> event_counts(workers, 0), click_counts(workers, 0);
+    const auto shard_for = [workers](Key canonical) {
+        // This maps the same canonical user to the same worker for both tables.
+        return static_cast<std::size_t>(canonical) % workers;
+    };
+    for (const auto& event : events) ++event_counts[shard_for(event.user)];
+    for (const auto& click : clicks) ++click_counts[shard_for(click.user)];
+    for (std::size_t i = 0; i < workers; ++i) {
+        partitions[i].events.reserve(event_counts[i]);
+        partitions[i].clicks.reserve(click_counts[i]);
+    }
+    for (const auto& event : events) partitions[shard_for(event.user)].events.push_back(event);
+    for (const auto& click : clicks) partitions[shard_for(click.user)].clicks.push_back(click);
+    // Free the original, unpartitioned collections before sorting.
+    std::vector<Event>().swap(events);
+    std::vector<Click>().swap(clicks);
+    profile("canonical_partition_route_seconds", route_start);
+
+    const auto workers_start = Clock::now();
+    std::vector<PartitionResult> results(workers);
+    std::vector<std::exception_ptr> failures(workers);
+    const auto process = [&](std::size_t index) {
+        try {
+            auto& part = partitions[index];
+            std::ranges::sort(part.events, {}, [](const Event& event) {
+                return std::pair{event.user, event.time};
+            });
+            std::ranges::sort(part.clicks, {}, [](const Click& click) {
+                return std::tuple{click.user, click.time, click.id};
+            });
+            const auto sessions = sessions_for(part.events);
+            auto& result = results[index];
+            result.sessions = static_cast<Integer>(sessions.size());
+            result.users = aggregate_users(part.events, sessions, categories);
+            result.campaigns = attribute(
+                part.events, sessions, part.clicks, organic, campaign_count);
+        } catch (...) {
+            failures[index] = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(workers - 1);
+        for (std::size_t i = 1; i < workers; ++i) {
+            threads.emplace_back(process, i);
+        }
+        process(0);
+    }
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+    profile("canonical_partition_workers_seconds", workers_start);
+
+    const auto merge_start = Clock::now();
+    ParallelUserResult combined;
+    combined.campaigns.resize(campaign_count);
+    std::size_t total_users = 0;
+    for (const auto& result : results) total_users += result.users.size();
+    combined.users.reserve(total_users);
+    for (auto& result : results) {
+        add(combined.sessions, result.sessions);
+        combined.users.insert(combined.users.end(),
+            std::make_move_iterator(result.users.begin()),
+            std::make_move_iterator(result.users.end()));
+        for (std::size_t campaign = 0; campaign < campaign_count; ++campaign) {
+            for (const auto& [day, subtotal] : result.campaigns[campaign]) {
+                auto& total = combined.campaigns[campaign][day];
+                add(total.sessions, subtotal.sessions);
+                add(total.purchasing_sessions, subtotal.purchasing_sessions);
+                add(total.revenue, subtotal.revenue);
+                add(total.assisted_sessions, subtotal.assisted_sessions);
+            }
+        }
+    }
+    profile("canonical_partition_merge_seconds", merge_start);
+    return combined;
+}
+
 std::string date_text(Integer day) {
     // Gregorian conversion over the full range of UTC days derived from i64
     // milliseconds. std::chrono::year has a narrower representation.
@@ -1113,35 +1216,63 @@ void run(const Path& data, const Path& reports) {
     load_catalog(input, data / "products.csv", products);
     const Key unknown = products.labels.intern("unknown");
     auto events = load_events(input, data, window, identities, products, unknown);
-    start = Clock::now();
-    sort_events(events);
-    profile("event_sort_seconds", start);
+    const auto* partition_flag = std::getenv("SESSION_CANONICAL_PARTITIONS");
+    if (partition_flag && View(partition_flag) == "1" && worker_budget() > 1) {
+        // Global event deduplication and canonical identity resolution are
+        // complete; click deduplication also finishes before partitioning.
+        Catalog campaigns;
+        load_catalog(input, data / "campaigns.csv", campaigns);
+        Clicks clicks;
+        load_clicks(input, data, window, identities, campaigns, clicks);
+        const Key organic = campaigns.insert("organic", "organic");
+        const Integer event_count = static_cast<Integer>(events.size());
 
-    start = Clock::now();
-    const auto sessions = sessions_for(events);
-    profile("sessionize_seconds", start);
-    start = Clock::now();
-    const auto user_rows = aggregate_users(events, sessions, products.labels);
-    profile("user_aggregate_seconds", start);
+        start = Clock::now();
+        auto grouped = process_user_partitions(
+            std::move(events), std::move(clicks.records),
+            products.labels, organic, campaigns.ids.size());
+        profile("canonical_partition_total_seconds", start);
 
-    Catalog campaigns;
-    load_catalog(input, data / "campaigns.csv", campaigns);
-    Clicks clicks;
-    load_clicks(input, data, window, identities, campaigns, clicks);
-    const Key organic = campaigns.insert("organic", "organic");
-    start = Clock::now();
-    std::ranges::sort(clicks.records, {}, [](const Click& click) {
-        return std::tuple{click.user, click.time, click.id};
-    });
-    profile("click_sort_seconds", start);
+        start = Clock::now();
+        write_reports(reports, grouped.users, identities, products.labels,
+                      grouped.campaigns, campaigns, event_count, grouped.sessions);
+        profile("csv_export_seconds", start);
+    } else {
+        // Preserve the verified serial post-deduplication pipeline as the
+        // production default for exact A/B comparisons.
+        start = Clock::now();
+        sort_events(events);
+        profile("event_sort_seconds", start);
 
-    start = Clock::now();
-    const auto campaign_rows = attribute(events, sessions, clicks.records, organic, campaigns.ids.size());
-    profile("attribute_seconds", start);
-    start = Clock::now();
-    write_reports(reports, user_rows, identities, products.labels, campaign_rows, campaigns,
-                  static_cast<Integer>(events.size()), static_cast<Integer>(sessions.size()));
-    profile("csv_export_seconds", start);
+        start = Clock::now();
+        const auto sessions = sessions_for(events);
+        profile("sessionize_seconds", start);
+        start = Clock::now();
+        const auto user_rows = aggregate_users(events, sessions, products.labels);
+        profile("user_aggregate_seconds", start);
+
+        Catalog campaigns;
+        load_catalog(input, data / "campaigns.csv", campaigns);
+        Clicks clicks;
+        load_clicks(input, data, window, identities, campaigns, clicks);
+        const Key organic = campaigns.insert("organic", "organic");
+        start = Clock::now();
+        std::ranges::sort(clicks.records, {}, [](const Click& click) {
+            return std::tuple{click.user, click.time, click.id};
+        });
+        profile("click_sort_seconds", start);
+
+        start = Clock::now();
+        const auto campaign_rows = attribute(
+            events, sessions, clicks.records, organic, campaigns.ids.size());
+        profile("attribute_seconds", start);
+        start = Clock::now();
+        write_reports(reports, user_rows, identities, products.labels,
+                      campaign_rows, campaigns,
+                      static_cast<Integer>(events.size()),
+                      static_cast<Integer>(sessions.size()));
+        profile("csv_export_seconds", start);
+    }
     std::cout << "[INNER] input_read_seconds " << input.read_seconds << '\n';
     if (input.map_partitions) {
         std::cout << "[INNER] input_map_seconds " << input.map_seconds << '\n';
