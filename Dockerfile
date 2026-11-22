@@ -70,4 +70,8 @@ ENV SESSION_ENGINE=/app/cpp_engine
 FROM cpp AS cpp_mmap
 ENV SESSION_MMAP=1
 
+# Explicit opt-in experiment: compare against the mmap baseline with the same binary.
+FROM cpp_mmap AS cpp_parallel_sort
+ENV SESSION_PARALLEL_SORT=1
+
 FROM cpp_mmap AS competition

@@ -89,6 +89,10 @@ def main():
             image,
         ]
 
+        # Optional experimental sorting architecture; defaults to the baseline.
+        if os.getenv("SESSION_PARALLEL_SORT") == "1":
+            command[-1:-1] = ["-e", "SESSION_PARALLEL_SORT=1"]
+
         return subprocess.run(
             command,
             check=False,

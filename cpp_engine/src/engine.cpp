@@ -606,6 +606,66 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
     profile("click_parse_dedup_validate_seconds", start);
 }
 
+// Sort by (canonical numeric user, timestamp) without mixing user groups.
+// Range partitioning preserves global order when shards are concatenated.
+// Keep the old single-thread sort as the default until paired benchmarks show
+// that parallel partitioning beats its extra memory traffic.
+void sort_events(std::vector<Event>& events) {
+    const auto compare = [](const Event& a, const Event& b) {
+        return std::pair{a.user, a.time} < std::pair{b.user, b.time};
+    };
+    const char* configured = std::getenv("SESSION_PARALLEL_SORT");
+    const auto workers = worker_budget();
+    if (!configured || View(configured) != "1" || workers < 2 || events.size() < 100'000) {
+        std::ranges::sort(events, compare);
+        return;
+    }
+
+    const auto partition_start = Clock::now();
+    Key max_user = 0;
+    for (const auto& event : events) {
+        max_user = std::max(max_user, event.user);
+    }
+    // Use 64-bit arithmetic so max_user == UINT32_MAX is safe.
+    const auto range = static_cast<std::uint64_t>(max_user) + 1;
+    const auto shard_of = [&](Key user) -> std::size_t {
+        return static_cast<std::size_t>((static_cast<std::uint64_t>(user) * workers) / range);
+    };
+    std::vector<std::size_t> counts(workers, 0);
+    for (const auto& event : events) {
+        ++counts[shard_of(event.user)];
+    }
+    std::vector<std::vector<Event>> shards(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
+        shards[i].reserve(counts[i]);
+    }
+    for (const auto& event : events) {
+        shards[shard_of(event.user)].push_back(event);
+    }
+    std::vector<Event>().swap(events);
+    profile("parallel_sort_partition_seconds", partition_start);
+
+    const auto sorting_start = Clock::now();
+    std::vector<std::jthread> threads;
+    threads.reserve(workers - 1);
+    for (std::size_t i = 1; i < workers; ++i) {
+        threads.emplace_back([&, i] { std::ranges::sort(shards[i], compare); });
+    }
+    std::ranges::sort(shards[0], compare);
+    // All shards must finish sorting before we concatenate them.
+    threads.clear();
+    profile("parallel_sort_workers_seconds", sorting_start);
+
+    const auto merge_start = Clock::now();
+    std::size_t total = 0;
+    for (const auto& shard : shards) total += shard.size();
+    events.reserve(total);
+    for (const auto& shard : shards) {
+        events.insert(events.end(), shard.begin(), shard.end());
+    }
+    profile("parallel_sort_merge_seconds", merge_start);
+}
+
 struct Session {
     std::size_t first;
     std::size_t end;
@@ -938,7 +998,7 @@ void run(const Path& data, const Path& reports) {
     const Key unknown = products.labels.intern("unknown");
     auto events = load_events(input, data, window, identities, products, unknown);
     start = Clock::now();
-    std::ranges::sort(events, {}, [](const Event& event) { return std::pair{event.user, event.time}; });
+    sort_events(events);
     profile("event_sort_seconds", start);
 
     start = Clock::now();
