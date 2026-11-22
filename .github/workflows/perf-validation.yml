@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - perf/indexed-campaign-window
+      - perf/parallel-event-sort
   pull_request:
     paths:
       - 'cpp_engine/**'
