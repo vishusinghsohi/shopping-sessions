@@ -64,14 +64,14 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_COMPACT_WINNERS"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_FINGERPRINTED_WINNERS"):
                     env.pop(toggle, None)
                 if optimized:
                     if os.environ.get("SORT_TEST_MODE") == "route_export":
                         env["SESSION_PARALLEL_ROUTING"] = "1"
                         env["SESSION_CSV_SAFETY_HINT"] = "1"
-                    elif os.environ.get("SORT_TEST_MODE") == "compact_winners":
-                        env["SESSION_COMPACT_WINNERS"] = "1"
+                    elif os.environ.get("SORT_TEST_MODE") == "fingerprinted_winners":
+                        env["SESSION_FINGERPRINTED_WINNERS"] = "1"
                     else:
                         env["SESSION_PARALLEL_SORT"] = "1"
                 started = time.perf_counter()
