@@ -106,6 +106,31 @@ def inspect_diagnostic_csv(path, schema):
 
     return has_rows, safe_for_direct_csv
 
+def inspect_report_with_engine_hint(csv_path, schema):
+    """
+    Trust only an explicit per-run hint produced by the C++ report writer.
+    Unknown/malformed hints always use the original byte scanner.
+    Always check the exact CSV header even with a hint.
+    """
+    hint_file = csv_path.with_suffix(".safe")
+    if not hint_file.is_file():
+        return inspect_diagnostic_csv(csv_path, schema)
+
+    hint = hint_file.read_bytes()
+    if hint not in (b"safe\\n", b"unsafe\\n"):
+        return inspect_diagnostic_csv(csv_path, schema)
+
+    header = (",".join(name for name, _ in schema) + "\\n").encode("utf-8")
+    with csv_path.open("rb") as source:
+        actual = source.readline()
+    if actual != header:
+        raise ValueError(f"Unexpected report header in {csv_path}: {actual!r}")
+
+    # The engine always writes a trailing newline after every output row.
+    has_rows = csv_path.stat().st_size > len(header)
+    return has_rows, hint == b"safe\\n"
+
+
 def diagnostic_csv_to_jsonl(csv_path, json_path, schema):
     """
     Safe fallback for the competition's unusual
@@ -260,7 +285,7 @@ def write_report(
 
     scan_start = time.perf_counter()
 
-    has_rows, fast_safe = inspect_diagnostic_csv(
+    has_rows, fast_safe = inspect_report_with_engine_hint(
         csv_path,
         schema,
     )
