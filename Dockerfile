@@ -79,4 +79,8 @@ FROM cpp_mmap AS cpp_route_export
 ENV SESSION_PARALLEL_ROUTING=1
 ENV SESSION_CSV_SAFETY_HINT=1
 
+# Opt-in experiment: reuse routing hashes during deduplication.
+FROM cpp_mmap AS cpp_hash_once
+ENV SESSION_HASH_ONCE=1
+
 FROM cpp_mmap AS competition
