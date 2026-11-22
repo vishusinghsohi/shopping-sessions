@@ -6,6 +6,7 @@ on:
       - perf/indexed-campaign-window
       - perf/parallel-event-sort
       - perf/route-and-export-profile
+      - perf/canonical-user-partition
   pull_request:
     paths:
       - 'cpp_engine/**'
@@ -48,5 +49,19 @@ jobs:
           MEM: '8g'
           SORT_TEST_EVENTS: '2000000'
           SORT_TEST_MODE: route_export
+          SORT_TEST_TRIALS: '3'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
+      - name: Verify canonical-user partition processing on official fixtures
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_CANONICAL_PARTITIONS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Benchmark 2M-event canonical-user parallel processing
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '2000000'
+          SORT_TEST_MODE: canonical_users
           SORT_TEST_TRIALS: '3'
         run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
