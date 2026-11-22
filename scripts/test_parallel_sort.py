@@ -77,8 +77,15 @@ def main():
                 env = dict(os.environ)
                 for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING"):
                     env.pop(toggle, None)
+                mode = os.environ.get("SORT_TEST_MODE", "")
+                if mode in ("direct_canonical", "buffered_canonical"):
+                    env["SESSION_CANONICAL_PARTITIONS"] = "1"
                 if optimized:
-                    if os.environ.get("SORT_TEST_MODE") == "route_export":
+                    if mode == "direct_canonical":
+                        env["SESSION_DIRECT_ROUTING"] = "1"
+                    elif mode == "buffered_canonical":
+                        env["SESSION_PARALLEL_ROUTING"] = "1"
+                    elif mode == "route_export":
                         env["SESSION_PARALLEL_ROUTING"] = "1"
                         env["SESSION_CSV_SAFETY_HINT"] = "1"
                     elif os.environ.get("SORT_TEST_MODE") == "canonical_users":
