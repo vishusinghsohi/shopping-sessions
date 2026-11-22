@@ -455,16 +455,19 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
     return winners;
 }
 
-// Compact alternative: a winner's raw CSV row already contains its event ID.
-// Avoid storing a redundant 16-byte string_view for every unique winning event.
-// The first CSV field is only extracted when a hash-table probe collides.
-std::vector<Winner> choose_winners_compact(const std::vector<View>& input) {
+// Fingerprinted winners trade a compact cached hash for the redundant ID view.
+// Only equal hash fingerprints require a costly string extraction/comparison.
+struct FingerprintedWinner {
+    Winner record;
+    std::size_t fingerprint;
+};
+std::vector<FingerprintedWinner> choose_winners_fingerprinted(const std::vector<View>& input) {
     if (input.size() >= std::numeric_limits<Key>::max()) {
         throw std::overflow_error("event shard index overflow");
     }
     const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
     std::vector<Key> buckets(bucket_count, 0);
-    std::vector<Winner> winners;
+    std::vector<FingerprintedWinner> winners;
     winners.reserve(input.size());
     for (const auto row : input) {
         const auto fields = parse_csv<7>(row);
@@ -472,23 +475,25 @@ std::vector<Winner> choose_winners_compact(const std::vector<View>& input) {
         const auto ingest = timestamp((*fields)[3]);
         if (!ingest) continue;
         const View id = (*fields)[0];
-        auto slot = std::hash<View>{}(id) & (bucket_count - 1);
+        const auto fingerprint = std::hash<View>{}(id);
+        auto slot = fingerprint & (bucket_count - 1);
         while (buckets[slot] != 0 &&
-               routing_id(winners[buckets[slot] - 1].line) != id) {
+               (winners[buckets[slot] - 1].fingerprint != fingerprint ||
+                routing_id(winners[buckets[slot] - 1].record.line) != id)) {
             slot = (slot + 1) & (bucket_count - 1);
         }
         if (buckets[slot] == 0) {
-            winners.push_back({row, *ingest});
+            winners.push_back({{row, *ingest}, fingerprint});
             buckets[slot] = static_cast<Key>(winners.size());
-        } else if (*ingest < winners[buckets[slot] - 1].ingest) {
-            winners[buckets[slot] - 1] = {row, *ingest};
+        } else if (*ingest < winners[buckets[slot] - 1].record.ingest) {
+            winners[buckets[slot] - 1].record = {row, *ingest};
         }
     }
     return winners;
 }
 
-static_assert(sizeof(Winner) < sizeof(IndexedWinner),
-              "compact winner must use less memory than indexed winner");
+static_assert(sizeof(FingerprintedWinner) < sizeof(IndexedWinner),
+              "fingerprinted winner must use less memory than indexed winner");
 
 struct EventShard {
     std::vector<View> users;
@@ -500,7 +505,7 @@ struct EventShard {
 EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
     EventShard shard;
     auto start = Clock::now();
-    const auto* mode = std::getenv("SESSION_COMPACT_WINNERS");
+    const auto* mode = std::getenv("SESSION_FINGERPRINTED_WINNERS");
     const bool compact = mode && View(mode) == "1";
 
     // Winner vectors remain in scope until validation completes; row views are
@@ -526,7 +531,7 @@ EventShard load_shard(std::vector<View> rows, Window window, const Catalog& prod
         }
     };
     if (compact) {
-        const auto winners = choose_winners_compact(rows);
+        const auto winners = choose_winners_fingerprinted(rows);
         std::vector<View>().swap(rows);
         shard.dedup_seconds = seconds(start);
         start = Clock::now();
