@@ -88,4 +88,10 @@ FROM cpp_mmap AS cpp_direct_canonical
 ENV SESSION_DIRECT_ROUTING=1
 ENV SESSION_CANONICAL_PARTITIONS=1
 
+# Opt-in hash fingerprint compact-winner dedup + direct canonical routing.
+FROM cpp_mmap AS cpp_direct_fingerprint
+ENV SESSION_DIRECT_ROUTING=1
+ENV SESSION_CANONICAL_PARTITIONS=1
+ENV SESSION_FINGERPRINTED_WINNERS=1
+
 FROM cpp_mmap AS competition

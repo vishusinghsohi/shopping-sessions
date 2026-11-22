@@ -75,13 +75,19 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS"):
                     env.pop(toggle, None)
                 mode = os.environ.get("SORT_TEST_MODE", "")
-                if mode in ("direct_canonical", "buffered_canonical"):
+                if mode in ("direct_canonical", "buffered_canonical", "fingerprint_direct"):
                     env["SESSION_CANONICAL_PARTITIONS"] = "1"
+                if mode == "fingerprint_direct":
+                    # Both competitors use the verified direct router; only
+                    # the shard-local deduplication algorithm differs.
+                    env["SESSION_DIRECT_ROUTING"] = "1"
                 if optimized:
-                    if mode == "direct_canonical":
+                    if mode == "fingerprint_direct":
+                        env["SESSION_FINGERPRINTED_WINNERS"] = "1"
+                    elif mode == "direct_canonical":
                         env["SESSION_DIRECT_ROUTING"] = "1"
                     elif mode == "buffered_canonical":
                         env["SESSION_PARALLEL_ROUTING"] = "1"

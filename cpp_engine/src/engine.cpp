@@ -455,6 +455,48 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
     return winners;
 }
 
+// Keep a 64-bit hash fingerprint instead of an additional string_view per
+// winner. A matching fingerprint is always confirmed by exact event-ID
+// comparison, so hash collisions cannot change winner selection.
+struct FingerprintedWinner {
+    Winner record;
+    std::size_t fingerprint;
+};
+static_assert(sizeof(FingerprintedWinner) < sizeof(IndexedWinner));
+
+std::vector<FingerprintedWinner> choose_winners_fingerprinted(
+    const std::vector<View>& input) {
+    if (input.size() >= std::numeric_limits<Key>::max()) {
+        throw std::overflow_error("event shard index overflow");
+    }
+    const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
+    std::vector<Key> buckets(bucket_count, 0);
+    std::vector<FingerprintedWinner> winners;
+    winners.reserve(input.size());
+    for (const auto row : input) {
+        const auto fields = parse_csv<7>(row);
+        if (!fields || (*fields)[0].empty()) continue;
+        const auto ingest = timestamp((*fields)[3]);
+        if (!ingest) continue;
+        const View id = (*fields)[0];
+        const auto hash = std::hash<View>{}(id);
+        auto slot = hash & (bucket_count - 1);
+        while (buckets[slot] &&
+               (winners[buckets[slot] - 1].fingerprint != hash ||
+                routing_id(winners[buckets[slot] - 1].record.line) != id)) {
+            slot = (slot + 1) & (bucket_count - 1);
+        }
+        if (!buckets[slot]) {
+            winners.push_back({{row, *ingest}, hash});
+            buckets[slot] = static_cast<Key>(winners.size());
+        } else {
+            auto& current = winners[buckets[slot] - 1].record;
+            if (*ingest < current.ingest) current = {row, *ingest};
+        }
+    }
+    return winners;
+}
+
 struct EventShard {
     std::vector<View> users;
     std::vector<Event> events;
@@ -462,24 +504,38 @@ struct EventShard {
     double validate_seconds = 0;
 };
 
-EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
+EventShard load_shard(std::vector<View> rows, Window window,
+                      const Catalog& products, Key unknown) {
     EventShard shard;
     auto start = Clock::now();
-    const auto winners = choose_winners(rows);
-    std::vector<View>().swap(rows);
-    shard.dedup_seconds = seconds(start);
+    const auto* mode = std::getenv("SESSION_FINGERPRINTED_WINNERS");
+    const bool fingerprinted = mode && View(mode) == "1";
 
-    start = Clock::now();
-    std::unordered_map<View, Key> users;
-    shard.events.reserve(winners.size());
-    for (const auto& winner : winners) {
-        if (const auto valid = validate_event(winner.record, window, products, unknown)) {
-            const auto [key, inserted] = users.try_emplace(valid->user, static_cast<Key>(shard.users.size()));
-            if (inserted) {
-                shard.users.push_back(valid->user);
+    const auto validate_winners = [&](const auto& winners) {
+        std::unordered_map<View, Key> users;
+        shard.events.reserve(winners.size());
+        for (const auto& entry : winners) {
+            if (const auto valid = validate_event(entry.record, window, products, unknown)) {
+                const auto [it, inserted] = users.try_emplace(
+                    valid->user, static_cast<Key>(shard.users.size()));
+                if (inserted) shard.users.push_back(valid->user);
+                shard.events.push_back({
+                    valid->time, valid->revenue, it->second, valid->category});
             }
-            shard.events.push_back({valid->time, valid->revenue, key->second, valid->category});
         }
+    };
+    if (fingerprinted) {
+        const auto winners = choose_winners_fingerprinted(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
+    } else {
+        const auto winners = choose_winners(rows);
+        std::vector<View>().swap(rows);
+        shard.dedup_seconds = seconds(start);
+        start = Clock::now();
+        validate_winners(winners);
     }
     shard.validate_seconds = seconds(start);
     return shard;
