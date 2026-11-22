@@ -49,8 +49,19 @@ def main():
                 ts = base + ((i * 1237) % 1200) * 60_000
                 kind = "purchase" if i % 7 == 0 else "view"
                 price = "500" if kind == "purchase" else ""
+                duplicate_test = os.environ.get("SORT_TEST_DUPLICATES") == "1"
+                distinct = COUNT - max(1, COUNT // 10)
+                duplicate = duplicate_test and i >= distinct
+                event_id = i - distinct if duplicate else i
+                # Some late duplicates win by earlier ingestion time;
+                # others tie or lose, and some winning rows fail validation.
+                ingest = ts + 1000
+                if duplicate:
+                    ingest = base + (event_id % 2) * 1000
+                    if event_id % 11 == 0:
+                        kind = "invalid_event_kind"
                 out.write(
-                    f"e{i},u{(i * 43) % 2500:04d},{ts},{ts + 1000},"
+                    f"e{event_id},u{(i * 43) % 2500:04d},{ts},{ingest},"
                     f"{kind},{'p1' if i % 2 else 'p2'},{price}\n"
                 )
 
@@ -66,8 +77,17 @@ def main():
                 env = dict(os.environ)
                 for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_FUSED_EVENTS"):
                     env.pop(toggle, None)
+                mode = os.environ.get("SORT_TEST_MODE", "")
+                if mode == "fused_canonical":
+                    # A/B against the previously measured leading architecture,
+                    # so any difference is attributable to fused ingestion.
+                    env["SESSION_CANONICAL_PARTITIONS"] = "1"
                 if optimized:
-                    if os.environ.get("SORT_TEST_MODE") == "route_export":
+                    if mode == "fused_ingest":
+                        env["SESSION_FUSED_EVENTS"] = "1"
+                    elif mode == "fused_canonical":
+                        env["SESSION_FUSED_EVENTS"] = "1"
+                    elif mode == "route_export":
                         env["SESSION_PARALLEL_ROUTING"] = "1"
                         env["SESSION_CSV_SAFETY_HINT"] = "1"
                     elif os.environ.get("SORT_TEST_MODE") == "canonical_users":
