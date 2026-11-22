@@ -75,9 +75,15 @@ def main():
                 dest = root / f"{label}-{trial}"
                 dest.mkdir()
                 env = dict(os.environ)
-                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS"):
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT", "SESSION_CANONICAL_PARTITIONS", "SESSION_DIRECT_ROUTING", "SESSION_FINGERPRINTED_WINNERS", "SESSION_FLAT_SHARD_USERS"):
                     env.pop(toggle, None)
                 mode = os.environ.get("SORT_TEST_MODE", "")
+                if mode == "flat_users":
+                    # Both versions run the production competition options;
+                    # only shard-local user indexing differs.
+                    env["SESSION_DIRECT_ROUTING"] = "1"
+                    env["SESSION_CANONICAL_PARTITIONS"] = "1"
+                    env["SESSION_FINGERPRINTED_WINNERS"] = "1"
                 if mode in ("direct_canonical", "buffered_canonical", "fingerprint_direct"):
                     env["SESSION_CANONICAL_PARTITIONS"] = "1"
                 if mode == "fingerprint_direct":
@@ -85,7 +91,9 @@ def main():
                     # the shard-local deduplication algorithm differs.
                     env["SESSION_DIRECT_ROUTING"] = "1"
                 if optimized:
-                    if mode == "fingerprint_direct":
+                    if mode == "flat_users":
+                        env["SESSION_FLAT_SHARD_USERS"] = "1"
+                    elif mode == "fingerprint_direct":
                         env["SESSION_FINGERPRINTED_WINNERS"] = "1"
                     elif mode == "direct_canonical":
                         env["SESSION_DIRECT_ROUTING"] = "1"
