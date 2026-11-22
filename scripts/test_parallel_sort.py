@@ -6,6 +6,9 @@ exact resulting Parquet data, not just a checksum; it is NOT a timing benchmark.
 """
 import json
 import os
+import re
+import statistics
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -51,25 +54,43 @@ def main():
                     f"{kind},{'p1' if i % 2 else 'p2'},{price}\n"
                 )
 
-        baseline = root / "baseline"
-        parallel = root / "parallel"
-        for mode, dest in ((False, baseline), (True, parallel)):
-            dest.mkdir()
-            env = dict(os.environ)
-            for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT"):
-                env.pop(toggle, None)
-            if mode:
-                if os.environ.get("SORT_TEST_MODE") == "route_export":
-                    env["SESSION_PARALLEL_ROUTING"] = "1"
-                    env["SESSION_CSV_SAFETY_HINT"] = "1"
-                else:
-                    env["SESSION_PARALLEL_SORT"] = "1"
-            print("Running", "parallel" if mode else "baseline", flush=True)
-            subprocess.run([sys.executable, str(RUNNER), str(data), str(dest)],
-                           check=True, env=env)
-        subprocess.run([sys.executable, str(COMPARE), str(baseline), str(parallel)],
-                       check=True)
+        trials = max(1, int(os.environ.get("SORT_TEST_TRIALS", "1")))
+        measurements = {"baseline": [], "candidate": []}
+        for trial in range(trials):
+            outputs = {}
+            order = (False, True) if trial % 2 == 0 else (True, False)
+            for optimized in order:
+                label = "candidate" if optimized else "baseline"
+                dest = root / f"{label}-{trial}"
+                dest.mkdir()
+                env = dict(os.environ)
+                for toggle in ("SESSION_PARALLEL_SORT", "SESSION_PARALLEL_ROUTING", "SESSION_CSV_SAFETY_HINT"):
+                    env.pop(toggle, None)
+                if optimized:
+                    if os.environ.get("SORT_TEST_MODE") == "route_export":
+                        env["SESSION_PARALLEL_ROUTING"] = "1"
+                        env["SESSION_CSV_SAFETY_HINT"] = "1"
+                    else:
+                        env["SESSION_PARALLEL_SORT"] = "1"
+                started = time.perf_counter()
+                result = subprocess.run([sys.executable, str(RUNNER), str(data), str(dest)],
+                                        check=True, env=env, capture_output=True, text=True)
+                wall = time.perf_counter() - started
+                match = re.search(r"Python pipeline total:\\s+([0-9.]+) s", result.stdout)
+                if match is None:
+                    raise RuntimeError("Missing engine timing:\\n" + result.stdout[-2500:])
+                internal = float(match[1])
+                measurements[label].append(internal)
+                outputs[label] = dest
+                print(f"{label} trial={trial} pipeline={internal:.4f}s host={wall:.4f}s", flush=True)
+            subprocess.run([sys.executable, str(COMPARE),
+                            str(outputs["baseline"]), str(outputs["candidate"])],
+                           check=True)
         print(f"PASS: {COUNT:,}-event baseline and {os.getenv('SORT_TEST_MODE', 'parallel-sort')} Parquet outputs match", flush=True)
+        for name in ("baseline", "candidate"):
+            values = measurements[name]
+            print(f"PERF {name} median={statistics.median(values):.4f}s "
+                  f"range={min(values):.4f}-{max(values):.4f}s", flush=True)
 
 
 if __name__ == "__main__":
