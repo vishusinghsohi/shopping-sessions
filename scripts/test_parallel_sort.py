@@ -76,7 +76,7 @@ def main():
                 result = subprocess.run([sys.executable, str(RUNNER), str(data), str(dest)],
                                         check=True, env=env, capture_output=True, text=True)
                 wall = time.perf_counter() - started
-                match = re.search(r"Python pipeline total:\\s+([0-9.]+) s", result.stdout)
+                match = re.search(r"Python pipeline total:\s+([0-9.]+) s", result.stdout)
                 if match is None:
                     raise RuntimeError("Missing engine timing:\\n" + result.stdout[-2500:])
                 internal = float(match[1])
