@@ -417,7 +417,11 @@ struct IndexedWinner {
     Winner record;
 };
 
-std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
+std::vector<IndexedWinner> choose_winners(const std::vector<View>& input,
+                                          const std::vector<std::size_t>* cached_hashes = nullptr) {
+    if (cached_hashes && cached_hashes->size() != input.size()) {
+        throw std::logic_error("routing hashes must match input rows");
+    }
     if (input.size() >= std::numeric_limits<Key>::max()) {
         throw std::overflow_error("event shard index overflow");
     }
@@ -427,7 +431,8 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
     std::vector<Key> buckets(bucket_count, 0);
     std::vector<IndexedWinner> winners;
     winners.reserve(input.size());
-    for (const auto row : input) {
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const auto row = input[index];
         const auto fields = parse_csv<7>(row);
         if (!fields || (*fields)[0].empty()) {
             continue;
@@ -437,7 +442,9 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
             continue;
         }
         const auto id = (*fields)[0];
-        auto slot = std::hash<View>{}(id) & (bucket_count - 1);
+        // Reuse the event-ID hash already computed to route the row.
+        const auto hashed_id = cached_hashes ? (*cached_hashes)[index] : std::hash<View>{}(id);
+        auto slot = hashed_id & (bucket_count - 1);
         while (buckets[slot] != 0 && winners[buckets[slot] - 1].id != id) {
             slot = (slot + 1) & (bucket_count - 1);
         }
@@ -461,10 +468,11 @@ struct EventShard {
     double validate_seconds = 0;
 };
 
-EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
+EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown,
+                      const std::vector<std::size_t>* hashes = nullptr) {
     EventShard shard;
     auto start = Clock::now();
-    const auto winners = choose_winners(rows);
+    const auto winners = choose_winners(rows, hashes);
     std::vector<View>().swap(rows);
     shard.dedup_seconds = seconds(start);
 
@@ -582,16 +590,22 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
+    const auto* hash_mode = std::getenv("SESSION_HASH_ONCE");
+    const bool cache_hashes = hash_mode && View(hash_mode) == "1";
+    std::vector<std::vector<std::size_t>> routed_hashes;
+    if (cache_hashes) routed_hashes.resize(workers);
     std::vector<std::vector<View>> routed;
     if (const auto* setting = std::getenv("SESSION_PARALLEL_ROUTING");
-        setting && View(setting) == "1" && workers > 1) {
+        setting && View(setting) == "1" && workers > 1 && !cache_hashes) {
         routed = route_events_parallel(storage, workers);
     } else {
         routed.resize(workers);
         for (const auto& file : storage) {
             rows(file.view(), [&](View line) {
-                const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                const auto id_hash = std::hash<View>{}(routing_id(line));
+                const auto shard = id_hash % workers;
                 routed[shard].push_back(line);
+                if (cache_hashes) routed_hashes[shard].push_back(id_hash);
             });
         }
     }
@@ -605,7 +619,8 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
         threads.reserve(workers - 1);
         const auto build = [&](std::size_t i) {
             try {
-                shards[i] = load_shard(std::move(routed[i]), window, products, unknown);
+                shards[i] = load_shard(std::move(routed[i]), window, products, unknown,
+                                      cache_hashes ? &routed_hashes[i] : nullptr);
             } catch (...) {
                 failures[i] = std::current_exception();
             }
