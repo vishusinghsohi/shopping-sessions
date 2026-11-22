@@ -1,0 +1,33 @@
+name: Canonical-user 20M scaling benchmark
+
+on:
+  push:
+    branches:
+      - perf/canonical-20m-benchmark
+
+jobs:
+  canonical-scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build canonical-user C++ engine and run CTest
+        run: docker build --target cpp_mmap -t shopping-sessions:latest .
+      - name: Install output comparison dependencies
+        run: python3 -m pip install --user 'polars>=1.0,<2'
+      - name: Confirm original official fixtures
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SESSION_CANONICAL_PARTITIONS: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/run_fixtures.py fixtures -- python3 scripts/docker_run_windows.py
+      - name: Compare 20 million cross-chunk-duplicate events with exact Parquet and memory profiling
+        env:
+          CPUS: '4'
+          MEM: '8g'
+          SORT_TEST_EVENTS: '20000000'
+          SORT_TEST_MODE: canonical_users
+          SORT_TEST_DUPLICATES: '1'
+          SORT_TEST_TRIALS: '2'
+          SORT_TEST_PROFILE: '1'
+        run: TEST_DOCKER_USER="$(id -u):$(id -g)" python3 scripts/test_parallel_sort.py
