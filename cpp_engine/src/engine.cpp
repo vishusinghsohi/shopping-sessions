@@ -497,6 +497,49 @@ std::vector<FingerprintedWinner> choose_winners_fingerprinted(
     return winners;
 }
 
+// Optional allocation-light user interning for per-shard validation.
+// The slot contains an index+1 into the owning shard.users vector; zero means
+// empty. The existing string_views point into retained mapped input pages.
+class FlatShardUsers {
+public:
+    explicit FlatShardUsers(std::vector<View>& users) : users_(users), slots_(1024, 0) {}
+
+    Key intern(View name) {
+        if ((users_.size() + 1) * 4 >= slots_.size() * 3) {
+            grow();
+        }
+        const auto mask = slots_.size() - 1;
+        auto index = std::hash<View>{}(name) & mask;
+        while (slots_[index] != 0) {
+            const Key stored = slots_[index] - 1;
+            if (users_[stored] == name) return stored;
+            index = (index + 1) & mask;
+        }
+        if (users_.size() >= std::numeric_limits<Key>::max()) {
+            throw std::overflow_error("too many shard users");
+        }
+        const auto key = static_cast<Key>(users_.size());
+        users_.push_back(name);
+        slots_[index] = key + 1;
+        return key;
+    }
+
+private:
+    std::vector<View>& users_;
+    std::vector<Key> slots_;
+
+    void grow() {
+        std::vector<Key> bigger(slots_.size() * 2, 0);
+        const auto mask = bigger.size() - 1;
+        for (Key i = 0; i < users_.size(); ++i) {
+            auto index = std::hash<View>{}(users_[i]) & mask;
+            while (bigger[index]) index = (index + 1) & mask;
+            bigger[index] = i + 1;
+        }
+        slots_.swap(bigger);
+    }
+};
+
 struct EventShard {
     std::vector<View> users;
     std::vector<Event> events;
@@ -511,16 +554,25 @@ EventShard load_shard(std::vector<View> rows, Window window,
     const auto* mode = std::getenv("SESSION_FINGERPRINTED_WINNERS");
     const bool fingerprinted = mode && View(mode) == "1";
 
+    const auto* user_mode = std::getenv("SESSION_FLAT_SHARD_USERS");
+    const bool flat_users = user_mode && View(user_mode) == "1";
     const auto validate_winners = [&](const auto& winners) {
         std::unordered_map<View, Key> users;
+        FlatShardUsers compact_users(shard.users);
         shard.events.reserve(winners.size());
         for (const auto& entry : winners) {
             if (const auto valid = validate_event(entry.record, window, products, unknown)) {
-                const auto [it, inserted] = users.try_emplace(
-                    valid->user, static_cast<Key>(shard.users.size()));
-                if (inserted) shard.users.push_back(valid->user);
+                Key user_key;
+                if (flat_users) {
+                    user_key = compact_users.intern(valid->user);
+                } else {
+                    const auto [it, inserted] = users.try_emplace(
+                        valid->user, static_cast<Key>(shard.users.size()));
+                    if (inserted) shard.users.push_back(valid->user);
+                    user_key = it->second;
+                }
                 shard.events.push_back({
-                    valid->time, valid->revenue, it->second, valid->category});
+                    valid->time, valid->revenue, user_key, valid->category});
             }
         }
     };
